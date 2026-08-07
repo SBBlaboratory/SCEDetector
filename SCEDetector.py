@@ -2344,6 +2344,12 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--mask",
+        type=Path,
+        default=DEFAULT_MASK,
+        help=f"Fixed None-bin mask (default: {DEFAULT_MASK.name})",
+    )
+    parser.add_argument(
         "--species",
         type=str,
         default="human",
@@ -2353,179 +2359,17 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
-        "--arm-positions",
-        type=Path,
-        default=None,
-        help=(
-            "Optional override TSV of chromosome arm coordinates "
-            "(Idf, Chrom, Start, End, ...). Default comes from --species "
-            f"(human → {DEFAULT_HUMAN_ARM_POSITIONS.name})"
-        ),
-    )
-    parser.add_argument(
-        "--mask",
-        type=Path,
-        default=DEFAULT_MASK,
-        help=f"Fixed None-bin mask (default: {DEFAULT_MASK.name})",
-    )
-    parser.add_argument(
-        "--max-sparse-good-bins",
-        type=int,
-        default=DEFAULT_MAX_SPARSE_GOOD_BINS,
-        help=(
-            "Treat None-flanked good islands of at most this many 200 kb bins "
-            f"as None (default: {DEFAULT_MAX_SPARSE_GOOD_BINS}; 0 disables)"
-        ),
-    )
-    parser.add_argument(
         "-o",
         "--output",
         type=Path,
         default=Path("SCE_detected.xlsx"),
         help="Output Excel path (default: SCE_detected.xlsx)",
     )
-    parser.add_argument(
-        "--translocation-tolerance",
-        type=int,
-        default=10_000,
-        help="Breakpoint tolerance in bp (default: 10000, i.e. +/-10 kb)",
-    )
-    parser.add_argument(
-        "--translocation-min-fraction",
-        type=float,
-        default=0.05,
-        help="Minimum fraction of sample cells sharing a breakpoint (default: 0.05)",
-    )
-    parser.add_argument(
-        "--wc-dup-tot-ratio",
-        type=float,
-        default=DEFAULT_WC_DUP_TOT_RATIO,
-        help=(
-            "Dup-like WC: require (median c+w)/flank_dom >= this "
-            f"(default: {DEFAULT_WC_DUP_TOT_RATIO}; 0 disables WC-dup filter)"
-        ),
-    )
-    parser.add_argument(
-        "--wc-dup-max-strand-ratio",
-        type=float,
-        default=DEFAULT_WC_DUP_MAX_STRAND_RATIO,
-        help=(
-            "Dup-like WC: require max(c,w)/flank_dom >= this "
-            f"(default: {DEFAULT_WC_DUP_MAX_STRAND_RATIO})"
-        ),
-    )
-    parser.add_argument(
-        "--wc-dup-min-strand-ratio",
-        type=float,
-        default=DEFAULT_WC_DUP_MIN_STRAND_RATIO,
-        help=(
-            "Dup-like WC: require min(c,w)/flank_dom >= this "
-            f"(default: {DEFAULT_WC_DUP_MIN_STRAND_RATIO})"
-        ),
-    )
-    parser.add_argument(
-        "--wc-dup-flank-bins",
-        type=int,
-        default=DEFAULT_WC_DUP_FLANK_BINS,
-        help=(
-            "Homozygous flank bins per side for WC dup depth "
-            f"(default: {DEFAULT_WC_DUP_FLANK_BINS})"
-        ),
-    )
-    parser.add_argument(
-        "--wc-chrom-tot-ratio",
-        type=float,
-        default=DEFAULT_WC_CHROM_TOT_RATIO,
-        help=(
-            "Drop WC if median (c+w) > expected coverage × this "
-            f"(default: {DEFAULT_WC_CHROM_TOT_RATIO}; 0 disables coverage ceiling)"
-        ),
-    )
-    parser.add_argument(
-        "--wc-island-strong-balance",
-        type=float,
-        default=DEFAULT_WC_ISLAND_STRONG_BALANCE,
-        help=(
-            "A-WC-A island: keep when min(c,w)/max(c,w) >= this "
-            f"(default: {DEFAULT_WC_ISLAND_STRONG_BALANCE}; 0 disables island filter)"
-        ),
-    )
-    parser.add_argument(
-        "--wc-island-long-len",
-        type=int,
-        default=DEFAULT_WC_ISLAND_LONG_LEN_BP,
-        help=(
-            "A-WC-A island: length in bp that qualifies for the relaxed balance "
-            f"(default: {DEFAULT_WC_ISLAND_LONG_LEN_BP})"
-        ),
-    )
-    parser.add_argument(
-        "--wc-island-long-balance",
-        type=float,
-        default=DEFAULT_WC_ISLAND_LONG_BALANCE,
-        help=(
-            "A-WC-A island: relaxed balance for a long island "
-            f"(default: {DEFAULT_WC_ISLAND_LONG_BALANCE})"
-        ),
-    )
-    parser.add_argument(
-        "--wc-island-min-tot-ratio",
-        type=float,
-        default=DEFAULT_WC_ISLAND_MIN_TOT_RATIO,
-        help=(
-            "A-WC-A island: keep when (c+w) < flank_dom × this "
-            f"(default: {DEFAULT_WC_ISLAND_MIN_TOT_RATIO})"
-        ),
-    )
-    parser.add_argument(
-        "--wc-island-halved-ratio",
-        type=float,
-        default=DEFAULT_WC_ISLAND_HALVED_RATIO,
-        help=(
-            "A-WC-A island: keep when the flank-dominant strand inside the "
-            "island is <= deeper flank x this "
-            f"(default: {DEFAULT_WC_ISLAND_HALVED_RATIO}; 0 disables the escape)"
-        ),
-    )
-    parser.add_argument(
-        "--wc-island-halved-min-balance",
-        type=float,
-        default=DEFAULT_WC_ISLAND_HALVED_MIN_BALANCE,
-        help=(
-            "A-WC-A island: minimum balance required by the halved-strand "
-            f"escape (default: {DEFAULT_WC_ISLAND_HALVED_MIN_BALANCE})"
-        ),
-    )
-    parser.add_argument(
-        "--homo-island-min-len",
-        type=int,
-        default=DEFAULT_HOMO_ISLAND_MIN_LEN_BP,
-        help=(
-            "WC-A-WC island: drop a homozygous island shorter than this (bp) "
-            "when it is also depth-dropped "
-            f"(default: {DEFAULT_HOMO_ISLAND_MIN_LEN_BP}; 0 disables)"
-        ),
-    )
-    parser.add_argument(
-        "--homo-island-min-tot-ratio",
-        type=float,
-        default=DEFAULT_HOMO_ISLAND_MIN_TOT_RATIO,
-        help=(
-            "WC-A-WC island: keep when island median (c+w) >= deeper flanking "
-            f"WC run x this (default: {DEFAULT_HOMO_ISLAND_MIN_TOT_RATIO})"
-        ),
-    )
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
-    if args.translocation_tolerance < 0:
-        raise ValueError("--translocation-tolerance must be >= 0")
-    if not 0 < args.translocation_min_fraction <= 1:
-        raise ValueError("--translocation-min-fraction must be in (0, 1]")
-    if args.max_sparse_good_bins < 0:
-        raise ValueError("--max-sparse-good-bins must be >= 0")
     if not args.input.is_file():
         raise FileNotFoundError(f"Input not found: {args.input}")
     if not args.sv.is_file():
@@ -2538,10 +2382,11 @@ def main() -> None:
     raw = load_raw_bins(args.input)
     qc_cells = load_qc_cells(args.qc)
     raw = filter_to_qc_cells(raw, qc_cells)
+    # Filter thresholds are fixed to the values that produced SCE_detected.xlsx.
     none_bins, chrom_ends = load_none_mask(
-        args.mask, max_sparse_good_bins=args.max_sparse_good_bins
+        args.mask, max_sparse_good_bins=DEFAULT_MAX_SPARSE_GOOD_BINS
     )
-    arm_path = resolve_species_arm_path(args.species, args.arm_positions)
+    arm_path = resolve_species_arm_path(args.species)
     if not arm_path.is_file():
         raise FileNotFoundError(f"Arm positions file not found: {arm_path}")
     centromere_barriers = load_centromere_barriers_from_arms(arm_path)
@@ -2556,21 +2401,6 @@ def main() -> None:
         cell_sex=cell_sex,
         centromere_barriers=centromere_barriers,
         chrom_ends=chrom_ends,
-        translocation_tolerance=args.translocation_tolerance,
-        translocation_min_fraction=args.translocation_min_fraction,
-        wc_dup_tot_ratio=args.wc_dup_tot_ratio,
-        wc_dup_max_strand_ratio=args.wc_dup_max_strand_ratio,
-        wc_dup_min_strand_ratio=args.wc_dup_min_strand_ratio,
-        wc_dup_flank_bins=args.wc_dup_flank_bins,
-        wc_chrom_tot_ratio=args.wc_chrom_tot_ratio,
-        wc_island_strong_balance=args.wc_island_strong_balance,
-        wc_island_long_len_bp=args.wc_island_long_len,
-        wc_island_long_balance=args.wc_island_long_balance,
-        wc_island_min_tot_ratio=args.wc_island_min_tot_ratio,
-        wc_island_halved_ratio=args.wc_island_halved_ratio,
-        wc_island_halved_min_balance=args.wc_island_halved_min_balance,
-        homo_island_min_len_bp=args.homo_island_min_len,
-        homo_island_min_tot_ratio=args.homo_island_min_tot_ratio,
     )
     write_excel(events, args.output)
     counts = events["Event"].value_counts()
