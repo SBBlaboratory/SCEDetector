@@ -1,223 +1,52 @@
 # SCEDetector
 
-A **lightweight SCE and recurrent translocation candidate inference** tool for
-200 kb bin strand-state output.
+200 kb bin 단위 가닥 상태(`CC` / `WC` / `WW`)에서 **SCE**, **역위(Inversion)**, **재발성 전좌 후보(Translocation)** 를 찾는 경량 도구입니다.
 
-Results are heuristic candidates intended for quick screening rather than
-definitive SCE or structural-variant calling. Double crossovers are not modeled.
-The translocation label is based on recurrent breakpoints across cells and does
-not identify translocation partners.
+결과는 확정 호출이 아니라 **빠른 스크리닝용 후보**입니다. 전좌 라벨은 세포 간 절단점 재발성만 보고, 전좌 파트너는 식별하지 않습니다.
 
-## Overview
+---
 
-Given:
+## 한눈에 보는 파이프라인
 
-1. a raw 200 kb strand-state table (e.g. `*.txt.raw.gz`)
-2. a per-cell SV interval table (e.g. `lenient_filterFALSE.tsv`)
-3. a StrandPhaseR final output listing QC-passed cells (e.g. `StrandPhaseR_final_output.txt`)
-4. a fixed low-mappability / None-bin mask (`HGSVC.200000.txt`, shipped with the tool)
-5. a species chromosome arm table for centromeres (default human:
-   `chromosome_arm_positions_grch38.txt`)
+세포 × 염색체마다 아래 순서로 진행합니다 (`chrY`는 성별 판별에만 쓰고 SCE 호출은 하지 않음).
 
-Only QC-passed cells from the StrandPhaseR final output are analyzed. SCEDetector
-skips SV, None, and centromere-gap bins (copy-number SVs always; inversion /
-complex only when they are not tip-linked), cleans nested
-inversion-like sandwiches, and calls single-switch SCE-like candidates.
-Whole-chromosome double switches (`A-B-A`) become `Inversion` when shared by
-≥5% of cells, otherwise two `SCE` records. Recurrent single breakpoints shared
-by ≥5% of QC-passed cells are labeled as translocation candidates.
+```
+[1] 구간 마스킹
+      None / 센트로미어 / SV / 허용되지 않는 상태 제거
+        ↓
+[2] 깊이 기반 인공물 제거
+      (a) 중복처럼 보이는 WC 제거
+      (b) SV 구멍 가장의 짧은 조각 제거
+      (c) A-WC-A 불균형 WC 섬 제거
+      (d) WC-A-WC 짧은 동형접합 섬 제거
+        ↓
+[3] 이중 전환 추출
+      A-B-A 샌드위치 → 역위 또는 SCE 두 개
+      WW→WC→CC / CC→WC→WW → 항상 SCE 두 개
+        ↓
+[4] 단일 전환 호출
+      염색체 팔마다 상태 전환이 정확히 하나면 SCE
+      (+ 센트로미어를 가로지르는 예외)
+        ↓
+[5] 절단점 좌표 보정
+      SV로 지워진 구멍 안의 진짜 전환 위치로 옮김
+        ↓
+[6] 재발성 재분류
+      여러 세포가 같은 절단점을 공유하면 Translocation
+```
 
-### Scope and limitations
+---
 
-| Included | Not considered |
-|----------|----------------|
-| Single valid class switch per chromosome after skipping SV/None bins | Double (or multiple) crossovers |
-| Recurrent-breakpoint translocation heuristic | Translocation partner identification |
-| Pattern matching on `CC` / `WC` / `WW` | Full structural-variant or haplotype-aware validation |
-
-Chromosomes with multiple state changes (after filtering) are skipped by design.
-
-## Requirements
+## 요구사항
 
 - Python 3.9+
-- `pandas`
-- `openpyxl`
-
-Install dependencies:
+- `pandas`, `openpyxl`
 
 ```bash
 pip install -r requirements.txt
 ```
 
-## Input formats
-
-### 1. Raw 200 kb bins (`-i`)
-
-Tab-separated file (plain or `.gz`) with at least:
-
-| Column  | Description |
-|---------|-------------|
-| `chrom` | Chromosome (e.g. `chr1`) |
-| `start` | Bin start |
-| `end`   | Bin end |
-| `sample`| Sample name |
-| `cell`  | Cell ID |
-| `class` | Strand state: `CC`, `WC`, `WW`, or `None` |
-| `c` / `w` | Crick / Watson read counts (used to drop duplication-like WC) |
-
-### 2. SV intervals (`--sv`)
-
-Tab-separated file with SV spans already expressed on the same 200 kb grid
-(or overlapping it), e.g. `lenient_filterFALSE.tsv`:
-
-| Column  | Description |
-|---------|-------------|
-| `chrom` | Chromosome |
-| `start` | SV interval start |
-| `end`   | SV interval end |
-| `sample`| Sample name |
-| `cell`  | Cell ID |
-
-Bins overlapping these intervals for the same `(sample, cell, chrom)` are
-skipped as follows:
-
-- **deletion / duplication** (`del_*`, `dup_*`, `idup_*`): always skipped,
-  except **male chrX deletions** (kept when stitching; sex from chrY `c+w`).
-- **inversion / complex**: skipped **unless tip-linked** — the interval
-  reaches a chromosome tip (±1 Mb), sits tip-직전 (starts within 2 Mb of
-  pter or ends within 2 Mb of qter), or abuts (transitively) a tip-linked
-  CN skip or another tip-linked inv/complex. Tip-linked inv/complex strand
-  states stay available for SCE (e.g. WC→WW at a complex start that abuts a
-  tip deletion, or a tip-직전 complex with a short uncovered tip stub).
-
-**Male chrX:** WC segments are removed; SCE / A-B-A (inversion vs double SCE)
-use only `WW↔CC` transitions.
-
-### 3. QC-passed cells (`--qc`)
-
-StrandPhaseR final output TSV, e.g. `StrandPhaseR_final_output.txt`. Only
-`(sample, cell)` pairs present in this file are retained for SCE calling and
-for the translocation shared-cell denominator.
-
-| Column  | Description |
-|---------|-------------|
-| `sample`| Sample name |
-| `cell`  | Cell ID |
-
-Other columns (`chrom`, `start`, `end`, `class`, …) may be present and are ignored
-for QC filtering.
-
-### 4. Fixed None mask (`--mask`, default `HGSVC.200000.txt`)
-
-Shipped reference file of low-mappability / centromere-like bins:
-
-| Column  | Description |
-|---------|-------------|
-| `chrom` | Chromosome |
-| `start` | Bin start |
-| `end`   | Bin end |
-| `class` | `None` or `good` |
-
-Only `class == None` bins are skipped by default. In addition, without modifying
-this file:
-
-1. Short `good` islands flanked on both sides by `None` (≤5 bins by default)
-   are treated as `None`.
-2. Large `None` runs (≥10 bins) also absorb up to 5 flanking `good` bins on
-   each side, so short state stubs at heterochromatin edges (e.g. chr9 ~38 Mb)
-   are skipped.
-
-Use `--max-sparse-good-bins` to change or disable (`0`) that fill-in.
-
-### 5. Chromosome arm / centromere table (`--species` / `--arm-positions`)
-
-Default for `--species human` is `chromosome_arm_positions_grch38.txt`
-(GRCh38 p/q arms for chr1–22). Centromere barrier per chrom is the gap
-between p-arm end and q-arm start: `[p.End, q.Start)`.
-
-Chromosomes missing from the arm table (e.g. chrX) fall back to large
-HGSVC `None` runs (≥1 Mb) as barriers.
-
-## SCE candidate rule
-
-For each (`sample`, `cell`, `chrom`) — **`chrY` is skipped** (still used only
-to infer male/female via mapping depth):
-
-1. Sort 200 kb bins by genomic start.
-2. Skip bins that are `None` in the fixed mask, overlap the centromere
-   barrier, overlap an SV skip interval (del/dup/idup always; inv/complex
-   only when not tip-linked; male chrX deletions kept), or lack a valid
-   strand class (`CC` / `WC` / `WW`; male chrX keeps only `CC` / `WW`). Then
-   drop **duplication-like WC** runs using the local-flank asymmetry rule (see
-   below). Remaining true WC keeps the original SCE logic. Then drop short
-   (≤2 bin) state stubs that abut an SV skip hole so flanking states can
-   merge (guards idup/dup edge artifacts).
-3. Stitch remaining bins on the full chromosome and find `A-B-A` sandwiches
-   and two-step opposite paths (`WW→WC→CC` / `CC→WC→WW`).
-4. Valid `A-B-A` (ambiguous inversion vs two SCEs): both breakpoints shared
-   by ≥5% of QC cells (subclone) → `Inversion`; otherwise two `SCE` rows.
-   Centromere overlap does not force `Inversion`. Middle run is removed after
-   extraction.
-5. Two-step opposite (`WW→WC→CC` / `CC→WC→WW`): always two `SCE` rows (even if
-   the final homozygous run includes the centromere — not `Inversion`).
-6. Matching-flank sandwiches with invalid SCE transitions (e.g. `CC-WW-CC`) and
-   other non-sandwich `A-B-C` middles are dropped without emitting a dual.
-7. After cleanup, split at the centromere barrier and call a remaining
-   **exactly one** valid class change held to the **arm end** as SCE.
-8. **Centromere exception:** if kept flanks on either side of the centromere
-   barrier differ by a valid SCE transition and each flank is ≥5 Mb, emit one
-   `SCE`: prefer the raw breakpoint inside the barrier when there is exactly
-   one matching switch; otherwise use the start of the right kept flank.
-9. If a called SCE breakpoint (or the filtered gap that produced it) touches an
-   SV skip interval, replace the coordinate with the raw `left→right` switch in
-   that gap (judgment unchanged; only the reported position is corrected).
-
-### Valid SCE transitions
-
-| From | To |
-|------|----|
-| `WC` | `WW`, `CC` |
-| `WW` | `WC` |
-| `CC` | `WC` |
-
-**Male chrX only:** WC bins are dropped; allowed switches are `WW↔CC` only.
-
-### Double-switch rules
-
-**`A-B-A`** (return to the original flank class), including nested sandwiches —
-ambiguous between a true inversion and two SCEs:
-
-1. If both breakpoints are shared within the same `sample` and `chrom`
-   (±10 kb) by ≥5% of QC cells (subclone), emit `Inversion`.
-2. Else emit two `SCE` rows.
-
-Centromere overlap is not used to force `Inversion`.
-
-**Two-step opposite** (`WW→WC→CC` or `CC→WC→WW`):
-
-Always emit two `SCE` rows. Centromere inside the final homozygous state does
-**not** make this an `Inversion` (contrast with `A-B-A`).
-
-### Translocation candidate rule
-
-After SCE-like breakpoints are collected (including non-shared double-switch
-SCEs):
-
-1. Events are compared only within the same `sample` and `chrom`.
-2. For each breakpoint, the detector counts distinct cells with a breakpoint
-   within ±10 kb.
-3. If those cells represent at least 5% of all QC-passed cells in that sample,
-   their events are labeled `Translocation` instead of `SCE`, and the shared
-   percentage is reported in `Shared_cell_percent`.
-4. At least two distinct cells are required, even when one cell alone would
-   exceed 5% in a small sample.
-5. `Inversion` rows are not relabeled as translocation.
-
-The 10 kb tolerance and 5% threshold can be changed through command-line
-arguments. Recurrence-based labels indicate a possible subclone; they are not
-proof of a translocation or inversion.
-
-## Usage
+## 사용법
 
 ```bash
 python3 SCEDetector.py \
@@ -227,69 +56,253 @@ python3 SCEDetector.py \
   -o SCE_detected.xlsx
 ```
 
-### Arguments
+---
 
-| Argument | Description |
-|----------|-------------|
-| `-i`, `--input` | Raw 200 kb bin TSV / TSV.GZ (required) |
-| `--sv` | SV interval TSV (required) |
-| `--qc` | StrandPhaseR final output with QC-passed cells (required) |
-| `--mask` | Fixed None-bin mask (default: `HGSVC.200000.txt` next to the script) |
-| `--species` | Species for arm/centromere table (default: `human`) |
-| `--arm-positions` | Optional override TSV of p/q arm coordinates |
-| `-o`, `--output` | Output Excel path (default: `SCE_detected.xlsx`) |
-| `--translocation-tolerance` | Breakpoint tolerance in bp (default: `10000`) |
-| `--translocation-min-fraction` | Minimum shared-cell fraction (default: `0.05`) |
-| `--wc-dup-tot-ratio` | Dup filter: require `(c+w)/dom ≥` this (default: `1.35`; `0` disables the filter) |
-| `--wc-dup-max-strand-ratio` | Dup filter: require `max(c,w)/dom ≥` this (default: `0.85`) |
-| `--wc-dup-min-strand-ratio` | Dup filter: require `min(c,w)/dom ≥` this (default: `0.35`) |
-| `--wc-dup-flank-bins` | Homozygous flank bins per side used for `dom` (default: `25`) |
+## 입력
 
-### WC duplication filter (local-flank asymmetry)
+| 인자 | 파일 | 역할 |
+|------|------|------|
+| `-i` | `*.txt.raw.gz` | 200 kb bin 가닥 상태 (`chrom, start, end, sample, cell, class, c, w`) |
+| `--sv` | `lenient_filterFALSE.tsv` | 세포별 SV 구간 |
+| `--qc` | `StrandPhaseR_final_output.txt` | QC 통과 세포 목록 (이 세포만 분석) |
+| `--mask` | `HGSVC.200000.txt` (기본) | 저매핑성 / None bin 마스크 |
+| `--species` / `--arm-positions` | `chromosome_arm_positions_grch38.txt` | 센트로미어 장벽 (p-끝 ~ q-시작) |
 
-Goal: remove unmarked duplication that looks like WC (both colors present) but
-is not a true sister-chromatid WC state.
+**성별:** chrY의 읽기 깊이로 male/female을 판별합니다. 남성 chrX는 반수체라 `WC`를 제거하고 `WW↔CC`만 허용합니다.
 
-**Measurements**
-- WC depth: mean `c` and `w` on the **full contiguous raw WC run**, including
-  bins that the None mask would otherwise skip.
-- Flank depth `dom`: mean dominant strand of abutting homozygous run(s)
-  (WW→`w`, CC→`c`), up to `--wc-dup-flank-bins` bins per side; average if both
-  sides exist, then **floored by** the cell-wide homozygous median so shallow
-  peri-centromere / noisy flanks do not inflate ratios. If no homozygous
-  flank, use the cell-wide median alone.
+---
 
-**Drop (all three must hold)**
-1. `max(c,w) / dom ≥ 0.85` — at least one strand still near full homozygous
-2. `min(c,w) / dom ≥ 0.35` — the other strand is clearly present
-3. `(c+w) / dom ≥ 1.35` — total depth is elevated vs the flank
+## 알고리즘 (단계별)
 
-**Why this matches Strand-seq biology**
-- True WC: each strand ≈ half of `dom`, so `max` and `min` both ≈ 0.5 and
-  `tot/dom ≈ 1` → keep.
-- Tip duplication (keep original strand + add the opposite): `max ≈ 1`,
-  `min ≈ 0.5`, `tot/dom ≈ 1.5` → drop (e.g. G61 chr17 q-tip).
+### 1단계 — 구간 마스킹
 
-## Output format
+각 200 kb bin을 순서대로 검사하고, 아래 중 하나라도 해당하면 **버립니다**.
 
-Excel file with columns:
+| 조건 | 설명 |
+|------|------|
+| None 마스크 | `HGSVC.200000.txt`의 `None` bin. 짧은 good 섬(≤5 bin)이 None에 끼어 있어도 None으로 취급. 긴 None 런(≥10 bin)은 양옆 good 5 bin도 흡수 |
+| 센트로미어 | arm 표의 `[p.End, q.Start)`. 표에 없으면 긴 None 런(≥1 Mb)으로 대체 |
+| SV 구간 | 아래 SV 규칙 참고 |
+| 허용되지 않는 상태 | 보통 `CC`/`WC`/`WW`만 남김. 남성 chrX는 `CC`/`WW`만 |
 
-| Column    | Description                         |
-|-----------|-------------------------------------|
-| `Sample`  | Sample name                         |
-| `Cell_ID` | Cell ID                             |
-| `chr`     | Chromosome                          |
-| `start`   | Breakpoint start (left end of an inversion) |
-| `end`     | Right breakpoint for `Inversion`; empty for `SCE` / `Translocation` |
-| `Event`   | `SCE`, `Translocation`, or `Inversion` |
-| `Shared_cell_percent` | Shared-cell percentage for `Translocation` / `Inversion`; empty for `SCE` |
+**SV를 언제 지울까?**
 
-Example:
+- **결실 / 중복** (`del_*`, `dup_*`, `idup_*`): **항상** 제거  
+  (예외: 남성 chrX의 결실은 남김)
+- **역위 / complex**: 원칙적으로 제거하되, **말단에 연결된 것만 남김**
+  - 염색체 끝 ±1 Mb에 닿거나
+  - 끝에서 2 Mb 이내에서 시작/끝나거나
+  - 이미 말단에 연결된 다른 SV와 맞닿아 있으면 유지
 
-| Sample | Cell_ID | chr | start | Event | Shared_cell_percent |
-|--------|---------|-----|-------|-------|---------------------|
-| fastq0022_HPNE_M | ...G02 | chr7 | 62200000 | SCE | |
-| fastq0022_HPNE_M | ...G03 | chr7 | 17600000 | Translocation | 8.33 |
+살아남은 bin들을 이어 붙이면 **상태 런(run)** 이 됩니다.  
+예: `WW WWW WW WC WC CC CC` → `WW | WC | CC`
+
+---
+
+### 2단계 — 깊이 기반 인공물 제거
+
+가닥 상태만 보면 SCE처럼 보이지만, **읽기 깊이**로 보면 중복·노이즈인 경우를 걸러냅니다.  
+핵심 측정값:
+
+| 기호 | 의미 |
+|------|------|
+| `c`, `w` | WC 구간의 Crick / Watson **중앙값** (연속된 원시 WC 런 전체, None으로 가려진 bin도 포함) |
+| `dom` | 옆 동형접합 런의 우세 가닥 깊이 (WW→`w`, CC→`c`). 양옆이 있으면 평균, 없거나 너무 얕으면 세포 전체 동형접합 중앙값으로 바닥을 잡음 |
+| `balance` | `min(c,w) / max(c,w)` — 1에 가까울수록 양쪽 가닥이 고르게 나뉨 |
+| 기대 커버리지 | bin마다 **다른 세포들의 상대 깊이 중앙값** × 이 세포의 유전체 중앙값. 매핑성 때문에 모든 세포에서 깊은 구간을 중복으로 오인하지 않기 위함 |
+
+#### 2a. 중복처럼 보이는 WC 제거
+
+표시되지 않은 중복은 “원래 가닥은 거의 그대로 + 반대 가닥이 더해짐” 패턴을 만듭니다.  
+진짜 WC는 양쪽이 각각 약 절반입니다.
+
+**옆면 비대칭 — 세 조건이 모두 참이면 제거**
+
+1. `max(c,w) / dom ≥ 0.85` — 한쪽 가닥이 거의 동형접합 수준
+2. `min(c,w) / dom ≥ 0.35` — 반대 가닥도 분명히 있음
+3. `(c+w) / dom ≥ 1.35` — 총 깊이가 옆보다 높음
+
+**커버리지 상한 — 이것만으로도 제거**
+
+- `(c+w) > 기대 커버리지 × 1.50`
+
+| | 진짜 WC (유지) | 말단 중복 (제거) |
+|--|----------------|------------------|
+| 패턴 | 양쪽 ≈ 0.5×dom, 합 ≈ dom | 한쪽 ≈ dom, 다른쪽 ≈ 0.5×dom, 합 ≈ 1.5×dom |
+
+#### 2b. SV 구멍 가장자리 조각 제거
+
+SV를 지운 뒤 구멍 옆에 1–2 bin짜리 상태 조각이 남으면 가짜 샌드위치가 생깁니다.  
+SV에 맞닿은 **≤2 bin** 런은 지워서 양옆이 이어지게 합니다.
+
+#### 2c. A-WC-A 불균형 WC 섬 제거
+
+같은 동형접합 사이에 끼인 WC (`WW-WC-WW` / `CC-WC-CC`)는 SCE 두 개로 풀리기 쉽습니다.  
+진짜 WC 섬이면 양쪽 가닥이 고르고 깊이도 복사수 중립이어야 합니다.  
+**아래 중 하나라도 만족하면 유지**, 아니면 섬을 지워 양옆 동형접합을 합칩니다.  
+(단일 WC 전환은 건드리지 않음)
+
+| # | 유지 조건 | 직관 |
+|---|-----------|------|
+| 1 | `balance ≥ 0.75` | 양쪽 가닥이 충분히 고름 |
+| 2 | 길이 ≥ 10 Mb **그리고** `balance ≥ 0.50` | 긴 섬은 균형 기준을 완화 |
+| 3 | `(c+w) < 0.55 × dom` | 깊이가 빠진 섬은 다른 종류의 인공물 → 여기서는 안 건드림 |
+| 4 | 옆에서 우세했던 가닥이 깊은 옆면의 `≤ 0.47`배 **그리고** `balance ≥ 0.35` | 우세 가닥이 깨끗이 반감 (복사수 중립 SCE) |
+| 5 | 양옆 모두 있고, 길이 ≤ 5 Mb, `balance ≥ 0.55`, 섬 총 깊이가 두 옆면 **사이**, 우세 가닥이 깊은 옆면의 `> 0.55`배, 소수 가닥이 얕은 옆면의 `≥ 0.45`배 | 양옆 깊이가 다를 때 (얕은 쪽 ≈ 섬, 깊은 쪽만 큼) |
+
+#### 2d. WC-A-WC 짧은 동형접합 섬 제거
+
+거울 형태: WC 안에 끼인 짧은 `WW`/`CC` (`WC-CC-WC` / `WC-WW-WC`).  
+수 Mb 거리에 SCE 두 번이면서 깊이가 떨어지는 경우는 거의 없습니다.
+
+**둘 다 참일 때만 제거**
+
+1. 섬 길이 `< 5 Mb`
+2. 섬 `(c+w) < 깊은 쪽 옆 WC × 0.80`
+
+깊이가 유지되는 짧은 섬은 남겨 둡니다.
+
+---
+
+### 3단계 — 이중 전환 추출과 판정
+
+필터를 통과한 상태 런에서 이중 전환을 찾아 따로 처리합니다.
+
+#### A-B-A 샌드위치 (예: `WW-WC-WW`, `CC-WC-CC`)
+
+원래 상태로 돌아오는 패턴 → **진짜 역위**일 수도, **SCE 두 번**일 수도 있습니다.
+
+| 우선순위 | 조건 | 결과 |
+|----------|------|------|
+| 1 | 두 절단점이 같은 sample·chrom에서 QC 세포의 ≥5%가 ±10 kb 안에 공유 | `Inversion` (+ 공유 %) |
+| 2 | 샌드위치 **안에 역위 SV 호출이 정확히 하나** 들어 있고, 샌드위치의 ≥40%를 덮음 | `Inversion` (공유 %는 비움 — SV 근거임을 표시) |
+| 3 | 그 외 | `SCE` 두 행 |
+
+> 조건 2의 예시: SV 호출기가 `inv_h2`를 28.2–31.8 Mb로만 잡고, 실제 WC는 28.2–34.6 Mb인 경우.  
+> 경계가 짧게 잘리면 남은 꼬리가 SCE 두 개로 오인됩니다.  
+> 역위 호출이 **여러 개** 흩어져 있는 긴 샌드위치는 SCE 두 개로 둡니다.
+
+센트로미어를 걸친다는 이유만으로 역위로 강제하지 않습니다.
+
+#### 이단 전환 (`WW→WC→CC` / `CC→WC→WW`)
+
+항상 **SCE 두 개**입니다. 마지막 동형접합이 센트로미어를 포함해도 역위로 바꾸지 않습니다.
+
+#### 그 밖의 패턴
+
+- 양옆은 같은데 유효한 SCE 전환이 아닌 경우 (예: `CC-WW-CC`): 가운데만 지우고 이벤트는 안 냄
+- `A-B-C`처럼 양옆이 다른 중간 런: 가운데만 지움
+
+---
+
+### 4단계 — 단일 전환 SCE
+
+이중 전환을 걷어낸 뒤, **센트로미어로 팔을 나누고** 팔마다:
+
+- 상태 런이 **정확히 2개**이고
+- 그 전환이 유효한 SCE이면  
+→ 절단점 하나 = `SCE`
+
+**센트로미어 예외:** 장벽 양옆 런이 유효한 SCE 전환이고 각 옆이 ≥5 Mb이면, 장벽을 가로지르는 SCE 하나를 추가로 호출합니다.  
+장벽 안에 원시 전환이 정확히 하나 있으면 그 좌표를, 없으면 오른쪽 런 시작을 씁니다.
+
+**유효한 SCE 전환**
+
+| From | To |
+|------|----|
+| `WC` | `WW`, `CC` |
+| `WW` | `WC` |
+| `CC` | `WC` |
+
+남성 chrX: `WW↔CC`만.
+
+---
+
+### 5단계 — SV 구멍 위 절단점 보정
+
+이어붙인 뒤 기본 절단점은 “제거 구간 **다음**에 살아남은 bin의 시작”입니다.  
+구멍(또는 절단점)이 SV에 닿으면, **마스크를 무시하고** 구멍 안 원시 bin을 다시 봅니다.
+
+- `왼쪽 상태 → 오른쪽 상태` 전환이 **정확히 하나** 있으면 → 그 좌표로 이동
+- 없거나 둘 이상이면 → 기본값(오른쪽 끝) 유지
+
+**샌드위치에서 나온 절단점**도 같은 보정을 쓰되,  
+구멍 전체가 SV로 **빈틈없이 덮인 경우만** 적용합니다.  
+(샌드위치 런은 염색체 전체를 묶기 때문에, 이 조건이 없으면 센트로미어·None 구간으로 잘못 들어갈 수 있음)
+
+> 보정하지 않으면 제거된 SV의 **먼쪽 경계**에 절단점이 붙습니다.  
+> 다른 세포의 진짜 절단점과 우연히 겹치면 가짜 전좌가 됩니다.  
+> 예: G63 chr10 — complex 127.8–131.0을 지운 뒤 131.0으로 보고되어, G04의 진짜 131.0과 겹쳐 Translocation으로 묶임. 보정 후 128.0(실제 WC→CC)으로 분리.
+
+---
+
+### 6단계 — 재발성 → Translocation
+
+모아 둔 SCE 계열 절단점 중:
+
+1. 같은 `sample` + `chrom`만 비교
+2. ±10 kb 안에 절단점이 있는 **서로 다른 세포** 수 계산
+3. 그 수가 QC 세포의 **≥5%** (최소 2세포)이면 → `Translocation` + 공유 %
+4. `Inversion` 행은 전좌로 바꾸지 않음
+
+---
+
+## 출력
+
+| 열 | 의미 |
+|----|------|
+| `Sample` | 샘플 |
+| `Cell_ID` | 세포 |
+| `chr` | 염색체 |
+| `start` | 절단점 (역위면 왼쪽) |
+| `end` | 역위의 오른쪽 절단점. SCE/Translocation은 비움 |
+| `Event` | `SCE` / `Translocation` / `Inversion` |
+| `Shared_cell_percent` | Translocation·(재발성) Inversion의 공유 %. SCE와 SV 근거 Inversion은 비움 |
+
+`Inversion`의 `Shared_cell_percent`가 비어 있으면 **SV 호출 근거**로 판정된 역위이고, 값이 있으면 **세포 간 재발성**으로 판정된 역위입니다.
+
+---
+
+## 명령줄 인자
+
+| 인자 | 기본값 | 설명 |
+|------|--------|------|
+| `-i` / `--input` | (필수) | raw 200 kb bin |
+| `--sv` | (필수) | SV 구간 |
+| `--qc` | (필수) | QC 통과 세포 |
+| `--mask` | `HGSVC.200000.txt` | None 마스크 |
+| `--species` | `human` | arm/센트로미어 표 |
+| `--arm-positions` | (species 기본) | arm 표 직접 지정 |
+| `-o` / `--output` | `SCE_detected.xlsx` | 출력 |
+| `--translocation-tolerance` | `10000` | 재발성 허용 오차 (bp) |
+| `--translocation-min-fraction` | `0.05` | 재발성 최소 세포 비율 |
+| `--wc-dup-tot-ratio` | `1.35` | 중복 필터: `(c+w)/dom` 하한 (`0`이면 필터 끔) |
+| `--wc-dup-max-strand-ratio` | `0.85` | 중복 필터: `max/dom` 하한 |
+| `--wc-dup-min-strand-ratio` | `0.35` | 중복 필터: `min/dom` 하한 |
+| `--wc-dup-flank-bins` | `25` | 옆면 깊이용 bin 수 |
+| `--wc-chrom-tot-ratio` | `1.50` | 커버리지 상한 배수 (`0`이면 끔) |
+| `--wc-island-strong-balance` | `0.75` | A-WC-A: 강한 균형 (`0`이면 섬 필터 끔) |
+| `--wc-island-long-len` | `10000000` | A-WC-A: 긴 섬 기준 (bp) |
+| `--wc-island-long-balance` | `0.50` | A-WC-A: 긴 섬의 완화 균형 |
+| `--wc-island-min-tot-ratio` | `0.55` | A-WC-A: 깊이 고갈 섬 유지 상한 |
+| `--wc-island-halved-ratio` | `0.47` | A-WC-A: 반감 탈출 (`0`이면 끔) |
+| `--wc-island-halved-min-balance` | `0.35` | A-WC-A: 반감 탈출의 최소 균형 |
+| `--homo-island-min-len` | `5000000` | WC-A-WC: 이보다 짧을 때 후보 (`0`이면 끔) |
+| `--homo-island-min-tot-ratio` | `0.80` | WC-A-WC: 옆 WC 대비 깊이 상한 |
+
+---
+
+## 범위와 한계
+
+| 포함 | 미포함 |
+|------|--------|
+| 필터 후 팔당 단일 유효 전환 | 이중·다중 교차의 완전 모델 |
+| 절단점 재발성 → 전좌 **후보** | 전좌 파트너 식별 |
+| `CC`/`WC`/`WW` 패턴 + 깊이 | 전체 SV·일배체형 검증 |
+
+필터 후에도 상태 전환이 여러 개인 팔은 단일 SCE로 호출하지 않습니다 (이중 전환은 3단계에서 이미 분리).
+
+---
 
 ## License
 

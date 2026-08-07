@@ -67,6 +67,42 @@ DEFAULT_WC_DUP_MAX_STRAND_RATIO = 0.85
 DEFAULT_WC_DUP_MIN_STRAND_RATIO = 0.35
 DEFAULT_WC_DUP_TOT_RATIO = 1.35
 DEFAULT_WC_DUP_FLANK_BINS = 25
+# WC total (c+w) may be up to this × the run's expected coverage (per-bin
+# cross-cell reference) before the dup-ceiling filter drops the run.
+DEFAULT_WC_CHROM_TOT_RATIO = 1.50
+# A-WC-A island (WC run wedged between two identical homozygous runs) is kept
+# unless its strands are lopsided while total depth still sits near the
+# homozygous flank — i.e. one strand carries almost everything and the minor
+# strand is background, so the island is noise rather than two real exchanges.
+DEFAULT_WC_ISLAND_STRONG_BALANCE = 0.75
+DEFAULT_WC_ISLAND_LONG_LEN_BP = 10_000_000
+DEFAULT_WC_ISLAND_LONG_BALANCE = 0.50
+DEFAULT_WC_ISLAND_MIN_TOT_RATIO = 0.55
+# Copy-neutral escape: the strand that dominates the flanks halves cleanly
+# inside the island while the minor strand is above background. Margin is tight
+# on the reviewed data (kept islands sit at 0.455, dropped ones at 0.483), so
+# retune on new samples.
+DEFAULT_WC_ISLAND_HALVED_RATIO = 0.47
+DEFAULT_WC_ISLAND_HALVED_MIN_BALANCE = 0.35
+# Between-flank escape: a short, reasonably balanced island whose total depth
+# sits between the two homozygous flanks (shallower flank similar to the island,
+# deeper flank higher — as in a true exchange next to uneven flanks). The
+# dominant strand must not have halved cleanly (that case is already covered
+# above) and the minor strand must clear a floor vs the shallower flank.
+DEFAULT_WC_ISLAND_BETWEEN_MAX_LEN_BP = 5_000_000
+DEFAULT_WC_ISLAND_BETWEEN_BALANCE = 0.55
+DEFAULT_WC_ISLAND_BETWEEN_MIN_HALVED = 0.55
+DEFAULT_WC_ISLAND_BETWEEN_MIN_MINOR = 0.45
+# Mirror case: a homozygous island inside a WC run (WC-WW-WC / WC-CC-WC). Two
+# exchanges only a few Mb apart are implausible, and a real one would stay
+# depth-neutral, so drop only when the island is both short and depth-dropped.
+DEFAULT_HOMO_ISLAND_MIN_LEN_BP = 5_000_000
+DEFAULT_HOMO_ISLAND_MIN_TOT_RATIO = 0.80
+# An A-B-A sandwich that is really one heterozygous inversion whose SV call
+# stopped short: exactly one inversion call inside the sandwich, covering at
+# least this fraction of it. Several scattered inversion calls inside a long
+# sandwich are a different situation and stay two SCEs.
+DEFAULT_SANDWICH_INV_MIN_COVER = 0.40
 # Tip slack: SV that overlaps a tip window (±1 Mb) is tip-reaching.
 DEFAULT_TELOMERE_SV_SLACK_BP = 1_000_000
 # Tip-직전: SV ending within this gap of qter (or starting within this of pter)
@@ -309,6 +345,54 @@ def _sv_touches_interval(
         if start == b or end == a:
             return True
     return False
+
+
+def _lone_inversion_call_in_span(
+    left_bp: int,
+    right_bp: int,
+    inv_intervals: list[tuple[int, int]],
+    min_cover: float = DEFAULT_SANDWICH_INV_MIN_COVER,
+) -> bool:
+    """
+    True if one inversion call sits inside ``[left_bp, right_bp)`` and fills it.
+
+    A heterozygous inversion shows up as a WC block in a homozygous background.
+    When the SV caller places the inversion but clips a boundary, the uncovered
+    remainder survives as an A-B-A sandwich and would otherwise be reported as
+    two SCEs. Requiring a single contained call that covers ``min_cover`` of the
+    span keeps that case apart from long sandwiches that merely happen to hold
+    several unrelated inversion calls.
+    """
+    span = right_bp - left_bp
+    if span <= 0 or not inv_intervals or min_cover <= 0:
+        return False
+    inside = [
+        (a, b) for a, b in inv_intervals if not (right_bp <= a or left_bp >= b)
+    ]
+    if len(inside) != 1:
+        return False
+    a, b = inside[0]
+    if a < left_bp or b > right_bp:
+        return False
+    return (b - a) >= span * min_cover
+
+
+def _gap_covered_by_sv(
+    lo: int, hi: int, skip_sv: list[tuple[int, int]]
+) -> bool:
+    """True if SV skip intervals tile ``[lo, hi)`` with no uncovered stretch."""
+    if hi <= lo or not skip_sv:
+        return False
+    cursor = lo
+    for a, b in sorted(skip_sv):
+        if b <= cursor:
+            continue
+        if a > cursor:
+            return False
+        cursor = b
+        if cursor >= hi:
+            return True
+    return cursor >= hi
 
 
 def _refine_sce_breakpoint_for_sv(
@@ -591,6 +675,15 @@ def _drop_sv_adjacent_stubs(
     return classes, starts, ends
 
 
+def _median(vals: list[float]) -> float:
+    """Return the median of a non-empty list (sorts a copy)."""
+    ordered = sorted(vals)
+    mid = len(ordered) // 2
+    if len(ordered) % 2 == 1:
+        return ordered[mid]
+    return (ordered[mid - 1] + ordered[mid]) / 2.0
+
+
 def _cell_homozygous_depth_refs(
     work: pd.DataFrame,
     none_bins: set[tuple[str, int, int]],
@@ -626,9 +719,105 @@ def _cell_homozygous_depth_refs(
             if dom > 0:
                 vals.append(dom)
         if vals:
-            vals.sort()
-            refs[(str(sample), str(cell))] = vals[len(vals) // 2]
+            refs[(str(sample), str(cell))] = _median(vals)
     return refs
+
+
+def _chrom_homozygous_depth_refs(
+    work: pd.DataFrame,
+    none_bins: set[tuple[str, int, int]],
+) -> dict[tuple[str, str, str], float]:
+    """
+    Per-(sample, cell, chrom) homozygous median dominant-strand depth.
+
+    Retained for reference/diagnostics; the dup ceiling itself now compares
+    against the per-bin cross-cell coverage reference instead.
+    """
+    if "c" not in work.columns or "w" not in work.columns:
+        return {}
+    homo = work[
+        work["class"].isin(["CC", "WW"]) & (work["chrom"].astype(str) != "chrY")
+    ]
+    if homo.empty:
+        return {}
+
+    refs: dict[tuple[str, str, str], float] = {}
+    for (sample, cell, chrom), group in homo.groupby(
+        ["sample", "cell", "chrom"], sort=False
+    ):
+        vals: list[float] = []
+        for start, end, cls, c_val, w_val in zip(
+            group["start"].astype(int),
+            group["end"].astype(int),
+            group["class"].astype(str),
+            group["c"].astype(float),
+            group["w"].astype(float),
+        ):
+            if (str(chrom), start, end) in none_bins:
+                continue
+            dom = w_val if cls == "WW" else c_val
+            if dom > 0:
+                vals.append(dom)
+        if vals:
+            refs[(str(sample), str(cell), str(chrom))] = _median(vals)
+    return refs
+
+
+def _bin_coverage_reference(
+    work: pd.DataFrame,
+    none_bins: set[tuple[str, int, int]],
+) -> tuple[dict[tuple[str, int], float], dict[tuple[str, str], float]]:
+    """
+    Cross-cell coverage reference: per-bin relative depth and per-cell scale.
+
+    Mappability makes some regions carry systematically more reads than the
+    genome average in *every* cell (e.g. the chr2 and chr13 q-terminal bands sit
+    near 1.3–1.5×). Judging a WC run against its own chromosome median therefore
+    flags a normal exchange there as a duplication. Instead, take each bin's
+    depth relative to its cell's genome-wide median and use the across-cell
+    median of that ratio as the bin's expected coverage.
+
+    Returns ``({(chrom, start): relative_depth}, {(sample, cell): median_depth})``
+    so expected depth for a bin in one cell is the product of the two.
+    """
+    if "c" not in work.columns or "w" not in work.columns:
+        return {}, {}
+    usable = work[work["chrom"].astype(str) != "chrY"].copy()
+    if usable.empty:
+        return {}, {}
+    keys = list(
+        zip(
+            usable["chrom"].astype(str),
+            usable["start"].astype(int),
+            usable["end"].astype(int),
+        )
+    )
+    usable = usable[[k not in none_bins for k in keys]]
+    if usable.empty:
+        return {}, {}
+
+    usable["total"] = usable["c"].astype(float) + usable["w"].astype(float)
+    cell_scale: dict[tuple[str, str], float] = {}
+    for (sample, cell), group in usable.groupby(["sample", "cell"], sort=False):
+        vals = [v for v in group["total"].tolist()]
+        if vals:
+            cell_scale[(str(sample), str(cell))] = _median(vals)
+
+    rel_by_bin: dict[tuple[str, int], list[float]] = {}
+    for sample, cell, chrom, start, total in zip(
+        usable["sample"].astype(str),
+        usable["cell"].astype(str),
+        usable["chrom"].astype(str),
+        usable["start"].astype(int),
+        usable["total"],
+    ):
+        scale = cell_scale.get((sample, cell), 0.0)
+        if scale <= 0:
+            continue
+        rel_by_bin.setdefault((chrom, start), []).append(float(total) / scale)
+
+    bin_rel = {key: _median(vals) for key, vals in rel_by_bin.items() if vals}
+    return bin_rel, cell_scale
 
 
 def _contiguous_raw_wc_depth(
@@ -641,7 +830,8 @@ def _contiguous_raw_wc_depth(
     raw_w: list[float],
 ) -> tuple[float, float] | None:
     """
-    Mean ``c``/``w`` over the full contiguous raw WC run covering ``[wc_start, wc_end)``.
+    Median ``c``/``w`` over the full contiguous raw WC run covering
+    ``[wc_start, wc_end)``.
 
     Includes bins that may later be skipped by the None mask so low-mappability
     tips of a true WC segment still contribute to the duplication check.
@@ -672,10 +862,7 @@ def _contiguous_raw_wc_depth(
     ):
         hi += 1
 
-    count = hi - lo + 1
-    mean_c = sum(raw_c[lo : hi + 1]) / count
-    mean_w = sum(raw_w[lo : hi + 1]) / count
-    return mean_c, mean_w
+    return _median(raw_c[lo : hi + 1]), _median(raw_w[lo : hi + 1])
 
 
 def _homozygous_flank_dom(
@@ -691,7 +878,7 @@ def _homozygous_flank_dom(
     max_bins: int,
 ) -> float | None:
     """
-    Mean dominant-strand depth of the homozygous run abutting a WC interval.
+    Median dominant-strand depth of the homozygous run abutting a WC interval.
 
     ``side`` ``"L"`` uses bins immediately before ``wc_start``; ``"R"`` uses
     bins immediately after ``wc_end``. WW → ``w``, CC → ``c``.
@@ -735,7 +922,7 @@ def _homozygous_flank_dom(
             j += 1
     if not vals:
         return None
-    return sum(vals) / len(vals)
+    return _median(vals)
 
 
 def _is_duplication_like_wc_depth(
@@ -760,6 +947,26 @@ def _is_duplication_like_wc_depth(
     )
 
 
+def _expected_run_depth(
+    start: int,
+    end: int,
+    raw_starts: list[int],
+    raw_ends: list[int],
+    raw_expected: list[float] | None,
+) -> float | None:
+    """Median expected coverage over the raw bins inside ``[start, end)``."""
+    if not raw_expected:
+        return None
+    vals = [
+        exp
+        for a, b, exp in zip(raw_starts, raw_ends, raw_expected)
+        if a >= start and b <= end and exp > 0
+    ]
+    if not vals:
+        return None
+    return _median(vals)
+
+
 def _drop_duplication_like_wc(
     classes: list[str],
     starts: list[int],
@@ -771,6 +978,8 @@ def _drop_duplication_like_wc(
     raw_classes: list[str],
     raw_c: list[float],
     raw_w: list[float],
+    raw_expected: list[float] | None = None,
+    chrom_tot_ratio: float = DEFAULT_WC_CHROM_TOT_RATIO,
     max_strand_ratio: float = DEFAULT_WC_DUP_MAX_STRAND_RATIO,
     min_strand_ratio: float = DEFAULT_WC_DUP_MIN_STRAND_RATIO,
     tot_ratio: float = DEFAULT_WC_DUP_TOT_RATIO,
@@ -779,14 +988,21 @@ def _drop_duplication_like_wc(
     """
     Drop WC runs that look like unmarked duplication vs local homozygous flanks.
 
-    WC depth uses the full contiguous raw WC run (including None-masked bins).
-    Dominant flank depth ``dom`` is the mean WW-``w`` / CC-``c`` of abutting
-    homozygous runs (up to ``flank_bins`` each side; average if both sides),
-    floored by the cell-wide homozygous median ``ref_depth`` so shallow
-    peri-centromere / noisy flanks do not inflate ratios. If no homozygous
-    flank exists, use ``ref_depth`` alone.
+    WC depth uses the full contiguous raw WC run (including None-masked bins),
+    with median ``c``/``w``. Dominant flank depth ``dom`` is the median
+    WW-``w`` / CC-``c`` of abutting homozygous runs (up to ``flank_bins`` each
+    side; average of side medians if both sides), floored by the cell-wide
+    homozygous median ``ref_depth`` so shallow peri-centromere / noisy flanks
+    do not inflate ratios. If no homozygous flank exists, use ``ref_depth``
+    alone.
 
-    Drop when all hold: ``max(c,w)/dom >= max_strand_ratio``,
+    Also drop when WC total ``c+w`` exceeds ``chrom_tot_ratio`` × the run's
+    expected coverage from ``raw_expected`` (per-bin cross-cell reference).
+    A copy-neutral WC run sits at its expected coverage; a duplication sits
+    above it. The reference is per-bin rather than per-chromosome because
+    mappability makes some bands run 1.3–1.5× the genome average in every cell.
+
+    Drop on flank asymmetry when all hold: ``max(c,w)/dom >= max_strand_ratio``,
     ``min(c,w)/dom >= min_strand_ratio``, ``(c+w)/dom >= tot_ratio``.
     """
     if (
@@ -819,6 +1035,18 @@ def _drop_duplication_like_wc(
         )
         if depth is not None:
             mean_c, mean_w = depth
+            tot = mean_c + mean_w
+            expected = _expected_run_depth(
+                starts[i], ends[j - 1], raw_starts, raw_ends, raw_expected
+            )
+            if (
+                expected is not None
+                and chrom_tot_ratio > 0
+                and tot > expected * chrom_tot_ratio
+            ):
+                drop_idx.update(range(i, j))
+                i = j
+                continue
             flank_doms = [
                 d
                 for d in (
@@ -877,6 +1105,238 @@ def _drop_duplication_like_wc(
         [item[1] for item in kept],
         [item[2] for item in kept],
     )
+
+
+def _drop_lopsided_wc_islands(
+    classes: list[str],
+    starts: list[int],
+    ends: list[int],
+    *,
+    ref_depth: float,
+    raw_starts: list[int],
+    raw_ends: list[int],
+    raw_classes: list[str],
+    raw_c: list[float],
+    raw_w: list[float],
+    strong_balance: float = DEFAULT_WC_ISLAND_STRONG_BALANCE,
+    long_len_bp: int = DEFAULT_WC_ISLAND_LONG_LEN_BP,
+    long_balance: float = DEFAULT_WC_ISLAND_LONG_BALANCE,
+    min_tot_ratio: float = DEFAULT_WC_ISLAND_MIN_TOT_RATIO,
+    halved_ratio: float = DEFAULT_WC_ISLAND_HALVED_RATIO,
+    halved_min_balance: float = DEFAULT_WC_ISLAND_HALVED_MIN_BALANCE,
+    flank_bins: int = DEFAULT_WC_DUP_FLANK_BINS,
+) -> tuple[list[str], list[int], list[int]]:
+    """
+    Drop WC islands wedged between two identical homozygous runs.
+
+    A real WC segment carries both templates at ~half the flank depth, so
+    ``balance = min(c, w) / max(c, w)`` is near 1. An island that keeps
+    near-flank total depth while one strand carries almost all of it is a
+    homozygous stretch with background on the minor strand, not two exchanges
+    a few Mb apart.
+
+    Keep the island when ``balance >= strong_balance``, when it spans at least
+    ``long_len_bp`` with ``balance >= long_balance``, when its total depth is
+    below ``min_tot_ratio`` × flank depth (depth-depleted islands are a
+    different artifact and are left to the existing filters), when the
+    flank-dominant strand halves cleanly inside the island (``<= halved_ratio``
+    of the deeper flank) while the minor strand clears ``halved_min_balance``,
+    or when a short island has total depth between the two flanks with moderate
+    balance (shallower flank ≈ island, deeper flank higher). Single
+    (non-sandwiched) WC transitions are never touched.
+    """
+    if not classes or strong_balance <= 0:
+        return classes, starts, ends
+
+    while True:
+        runs = _merge_runs(classes, starts, ends)
+        drop_start: int | None = None
+        drop_end: int | None = None
+        for k in range(1, len(runs) - 1):
+            cls, start, end = runs[k]
+            if cls != "WC":
+                continue
+            if runs[k - 1][0] != runs[k + 1][0] or runs[k - 1][0] == "WC":
+                continue
+            depth = _contiguous_raw_wc_depth(
+                start, end, raw_starts, raw_ends, raw_classes, raw_c, raw_w
+            )
+            if depth is None or max(depth) <= 0:
+                continue
+            balance = min(depth) / max(depth)
+            if balance >= strong_balance:
+                continue
+            if end - start >= long_len_bp and balance >= long_balance:
+                continue
+            flank_doms = [
+                d
+                for d in (
+                    _homozygous_flank_dom(
+                        "L",
+                        start,
+                        end,
+                        raw_starts,
+                        raw_ends,
+                        raw_classes,
+                        raw_c,
+                        raw_w,
+                        max_bins=flank_bins,
+                    ),
+                    _homozygous_flank_dom(
+                        "R",
+                        start,
+                        end,
+                        raw_starts,
+                        raw_ends,
+                        raw_classes,
+                        raw_c,
+                        raw_w,
+                        max_bins=flank_bins,
+                    ),
+                )
+                if d is not None and d > 0
+            ]
+            if flank_doms:
+                flank_mean = sum(flank_doms) / len(flank_doms)
+                dom = max(flank_mean, ref_depth) if ref_depth > 0 else flank_mean
+            else:
+                dom = ref_depth
+            if dom <= 0 or sum(depth) < dom * min_tot_ratio:
+                continue
+            island_dom = depth[0] if runs[k - 1][0] == "CC" else depth[1]
+            if (
+                flank_doms
+                and balance >= halved_min_balance
+                and island_dom <= max(flank_doms) * halved_ratio
+            ):
+                continue
+            # Between-flank escape (e.g. G49 chr1): short, balanced enough,
+            # total depth between the two flanks, dominant strand only partially
+            # dropped, minor strand clearly present vs the shallower flank.
+            if (
+                len(flank_doms) == 2
+                and end - start <= DEFAULT_WC_ISLAND_BETWEEN_MAX_LEN_BP
+                and balance >= DEFAULT_WC_ISLAND_BETWEEN_BALANCE
+                and min(flank_doms) <= sum(depth) < max(flank_doms)
+                and island_dom > max(flank_doms) * DEFAULT_WC_ISLAND_BETWEEN_MIN_HALVED
+                and min(depth) >= min(flank_doms) * DEFAULT_WC_ISLAND_BETWEEN_MIN_MINOR
+            ):
+                continue
+            drop_start, drop_end = start, end
+            break
+        if drop_start is None or drop_end is None:
+            break
+        kept = [
+            (cls, start, end)
+            for cls, start, end in zip(classes, starts, ends)
+            if end <= drop_start or start >= drop_end
+        ]
+        if len(kept) == len(classes):
+            break
+        classes = [item[0] for item in kept]
+        starts = [item[1] for item in kept]
+        ends = [item[2] for item in kept]
+
+    return classes, starts, ends
+
+
+def _run_median_total(
+    start: int,
+    end: int,
+    raw_starts: list[int],
+    raw_ends: list[int],
+    raw_c: list[float],
+    raw_w: list[float],
+) -> float | None:
+    """Median ``c+w`` over the raw bins inside ``[start, end)``."""
+    vals = [
+        c + w
+        for a, b, c, w in zip(raw_starts, raw_ends, raw_c, raw_w)
+        if a >= start and b <= end
+    ]
+    return _median(vals) if vals else None
+
+
+def _drop_short_homozygous_islands(
+    classes: list[str],
+    starts: list[int],
+    ends: list[int],
+    *,
+    raw_starts: list[int],
+    raw_ends: list[int],
+    raw_c: list[float],
+    raw_w: list[float],
+    min_len_bp: int = DEFAULT_HOMO_ISLAND_MIN_LEN_BP,
+    min_tot_ratio: float = DEFAULT_HOMO_ISLAND_MIN_TOT_RATIO,
+) -> tuple[list[str], list[int], list[int]]:
+    """
+    Drop short, depth-dropped homozygous islands inside a WC run.
+
+    Mirror of the WC-island filter: ``WC-WW-WC`` / ``WC-CC-WC``. Two exchanges
+    only a few Mb apart on an otherwise fully heterozygous chromosome are
+    implausible, and a genuine pair would leave total depth unchanged across the
+    island. Drop only when the island is shorter than ``min_len_bp`` *and* its
+    median ``c+w`` falls below ``min_tot_ratio`` × the deeper flanking WC run,
+    so depth-neutral short islands are left alone.
+    """
+    if not classes or min_len_bp <= 0:
+        return classes, starts, ends
+
+    while True:
+        runs = _merge_runs(classes, starts, ends)
+        drop_start: int | None = None
+        drop_end: int | None = None
+        for k in range(1, len(runs) - 1):
+            cls, start, end = runs[k]
+            if cls == "WC" or runs[k - 1][0] != "WC" or runs[k + 1][0] != "WC":
+                continue
+            if end - start >= min_len_bp:
+                continue
+            island = _run_median_total(
+                start, end, raw_starts, raw_ends, raw_c, raw_w
+            )
+            flanks = [
+                t
+                for t in (
+                    _run_median_total(
+                        runs[k - 1][1],
+                        runs[k - 1][2],
+                        raw_starts,
+                        raw_ends,
+                        raw_c,
+                        raw_w,
+                    ),
+                    _run_median_total(
+                        runs[k + 1][1],
+                        runs[k + 1][2],
+                        raw_starts,
+                        raw_ends,
+                        raw_c,
+                        raw_w,
+                    ),
+                )
+                if t is not None and t > 0
+            ]
+            if island is None or not flanks:
+                continue
+            if island >= max(flanks) * min_tot_ratio:
+                continue
+            drop_start, drop_end = start, end
+            break
+        if drop_start is None or drop_end is None:
+            break
+        kept = [
+            (cls, start, end)
+            for cls, start, end in zip(classes, starts, ends)
+            if end <= drop_start or start >= drop_end
+        ]
+        if len(kept) == len(classes):
+            break
+        classes = [item[0] for item in kept]
+        starts = [item[1] for item in kept]
+        ends = [item[2] for item in kept]
+
+    return classes, starts, ends
 
 
 def _overlaps_any(start: int, end: int, intervals: list[tuple[int, int]]) -> bool:
@@ -1023,14 +1483,28 @@ def _extract_aba_sandwiches(
     starts: list[int],
     ends: list[int],
     barriers: list[tuple[int, int]] | None = None,
+    raw_starts: list[int] | None = None,
+    raw_ends: list[int] | None = None,
+    raw_classes: list[str] | None = None,
+    skip_sv: list[tuple[int, int]] | None = None,
+    inv_intervals: list[tuple[int, int]] | None = None,
     *,
     male_chrx: bool = False,
-) -> tuple[list[str], list[int], list[int], list[tuple[int, int, bool, str]]]:
+) -> tuple[
+    list[str], list[int], list[int], list[tuple[int, int, bool, str, bool]]
+]:
     """
     Extract A-B-A and two-step-opposite sandwiches.
 
-    Returns duals as (left_bp, right_bp, spans_centromere, kind) where kind is
-    ``"aba"`` or ``"twostep"``.
+    Returns duals as (left_bp, right_bp, spans_centromere, kind, sv_inversion)
+    where kind is ``"aba"`` or ``"twostep"`` and ``sv_inversion`` marks a
+    sandwich that a single contained inversion call already explains.
+
+    Both breakpoints get the same SV coordinate correction the single-switch
+    path applies: when a switch was stitched across a removed SV, the raw bins
+    inside the hole decide the coordinate. Without it a sandwich breakpoint
+    snaps to the far edge of the hole, which can collide with a genuine
+    breakpoint in another cell and fake a recurrent subclone.
 
     - ``aba``: same-flank sandwich. ``spans_centromere`` is retained for
       diagnostics but resolution is by subclone recurrence only (see
@@ -1042,7 +1516,35 @@ def _extract_aba_sandwiches(
     without emitting a dual.
     """
     barriers = barriers or []
-    duals: list[tuple[int, int, bool, str]] = []
+    inv_intervals = inv_intervals or []
+    duals: list[tuple[int, int, bool, str, bool]] = []
+
+    def refine(bp: int, left_cls: str, right_cls: str, left_end: int) -> int:
+        if (
+            not skip_sv
+            or raw_starts is None
+            or raw_ends is None
+            or raw_classes is None
+        ):
+            return bp
+        # Runs here are merged over the whole chromosome, so a gap can be a
+        # centromere rather than an SV hole. Only correct across holes the SV
+        # skip fully accounts for; otherwise the raw peek wanders into masked
+        # bins and lands tens of Mb away.
+        if not _gap_covered_by_sv(min(left_end, bp), max(left_end, bp), skip_sv):
+            return bp
+        return _refine_sce_breakpoint_for_sv(
+            bp,
+            left_cls,
+            right_cls,
+            left_end,
+            bp,
+            raw_starts,
+            raw_ends,
+            raw_classes,
+            skip_sv,
+            male_chrx=male_chrx,
+        )
 
     while True:
         runs = _merge_runs(classes, starts, ends)
@@ -1055,18 +1557,31 @@ def _extract_aba_sandwiches(
         drop_through_right_start: int | None = None
 
         for i in range(len(runs) - 2):
-            left_cls, left_start, _ = runs[i]
+            left_cls, left_start, left_end = runs[i]
             mid_cls, mid_start, mid_end = runs[i + 1]
             right_cls, right_start, right_end = runs[i + 2]
 
             spans = _interval_overlaps_barrier(mid_start, right_start, barriers)
+            # Coordinates only; the drop bookkeeping below stays on run edges.
+            left_bp = refine(mid_start, left_cls, mid_cls, left_end)
+            right_bp = refine(right_start, mid_cls, right_cls, mid_end)
 
             if (
                 left_cls == right_cls
                 and is_sce_transition(left_cls, mid_cls, male_chrx=male_chrx)
                 and is_sce_transition(mid_cls, right_cls, male_chrx=male_chrx)
             ):
-                duals.append((mid_start, right_start, spans, "aba"))
+                duals.append(
+                    (
+                        left_bp,
+                        right_bp,
+                        spans,
+                        "aba",
+                        _lone_inversion_call_in_span(
+                            left_bp, right_bp, inv_intervals
+                        ),
+                    )
+                )
                 drop_start, drop_end = mid_start, mid_end
                 break
 
@@ -1074,7 +1589,7 @@ def _extract_aba_sandwiches(
                 left_cls, mid_cls, right_cls, male_chrx=male_chrx
             ):
                 # Always double SCE; centro in the final run does not make inversion.
-                duals.append((mid_start, right_start, False, "twostep"))
+                duals.append((left_bp, right_bp, False, "twostep", False))
                 # Remove left+mid; keep the final homozygous run.
                 drop_through_right_start = right_start
                 drop_start, drop_end = left_start, right_start
@@ -1419,9 +1934,14 @@ def resolve_double_switch_patterns(
     Resolve dual switches into Inversion or two SCE records.
 
     - ``twostep`` (WW→WC→CC / CC→WC→WW): always two SCEs.
-    - ``aba``: ambiguous (true inversion vs two SCEs). Emit ``Inversion`` only
-      when both breakpoints are shared by ≥5% of QC cells (subclone);
-      otherwise two SCE rows. Centromere overlap does not force Inversion.
+    - ``aba``: ambiguous (true inversion vs two SCEs). Emit ``Inversion`` when
+      both breakpoints are shared by ≥5% of QC cells (subclone), or when
+      ``sv_inversion`` marks the sandwich as already explained by a single
+      contained inversion call; otherwise two SCE rows. Centromere overlap does
+      not force Inversion.
+
+    ``Shared_cell_percent`` stays empty for an SV-backed inversion, so the two
+    provenances remain distinguishable in the output.
     """
     empty = pd.DataFrame(columns=list(OUTPUT_COLUMNS))
     if duals.empty:
@@ -1459,7 +1979,8 @@ def resolve_double_switch_patterns(
                 shared_mask = (starts - left).abs() <= tolerance
                 shared_mask &= (ends - right).abs() <= tolerance
                 shared_cells = cells[shared_mask].nunique()
-                if shared_cells >= required_cells:
+                sv_backed = bool(row.get("sv_inversion", False))
+                if shared_cells >= required_cells or sv_backed:
                     records.append(
                         {
                             "Sample": sample,
@@ -1468,8 +1989,10 @@ def resolve_double_switch_patterns(
                             "start": left,
                             "end": right,
                             "Event": "Inversion",
-                            "Shared_cell_percent": round(
-                                shared_cells / sample_cells * 100, 2
+                            "Shared_cell_percent": (
+                                pd.NA
+                                if shared_cells < required_cells
+                                else round(shared_cells / sample_cells * 100, 2)
                             ),
                         }
                     )
@@ -1505,6 +2028,15 @@ def detect_sce(
     wc_dup_max_strand_ratio: float = DEFAULT_WC_DUP_MAX_STRAND_RATIO,
     wc_dup_min_strand_ratio: float = DEFAULT_WC_DUP_MIN_STRAND_RATIO,
     wc_dup_flank_bins: int = DEFAULT_WC_DUP_FLANK_BINS,
+    wc_chrom_tot_ratio: float = DEFAULT_WC_CHROM_TOT_RATIO,
+    wc_island_strong_balance: float = DEFAULT_WC_ISLAND_STRONG_BALANCE,
+    wc_island_long_len_bp: int = DEFAULT_WC_ISLAND_LONG_LEN_BP,
+    wc_island_long_balance: float = DEFAULT_WC_ISLAND_LONG_BALANCE,
+    wc_island_min_tot_ratio: float = DEFAULT_WC_ISLAND_MIN_TOT_RATIO,
+    wc_island_halved_ratio: float = DEFAULT_WC_ISLAND_HALVED_RATIO,
+    wc_island_halved_min_balance: float = DEFAULT_WC_ISLAND_HALVED_MIN_BALANCE,
+    homo_island_min_len_bp: int = DEFAULT_HOMO_ISLAND_MIN_LEN_BP,
+    homo_island_min_tot_ratio: float = DEFAULT_HOMO_ISLAND_MIN_TOT_RATIO,
 ) -> pd.DataFrame:
     """
     Detect SCE, inversion, and recurrent translocation candidates.
@@ -1517,9 +2049,15 @@ def detect_sce(
     Centromere / arm barriers come from the species arm-position table when
     available (fallback: large HGSVC None runs). Non-SV WC runs that match
     the local-flank duplication depth pattern (one strand near-full, the
-    other present, elevated total) are dropped. A-B-A sandwiches are
-    resolved by subclone recurrence. Remaining single switches are scored
-    per arm; a centromere-crossing exception recovers masked single switches.
+    other present, elevated total) are dropped, as are WC runs whose total
+    depth exceeds their expected coverage times ``wc_chrom_tot_ratio``, where
+    expected coverage is the per-bin across-cell median so mappability-driven
+    coverage bands are not mistaken for gains. WC islands wedged between two
+    identical homozygous runs are dropped when their strands are lopsided at
+    near-flank total depth, and short depth-dropped homozygous islands inside a
+    WC run are dropped as well. A-B-A sandwiches are resolved by subclone
+    recurrence. Remaining single switches are scored per arm; a
+    centromere-crossing exception recovers masked single switches.
     """
     work = raw.copy()
     work["start"] = work["start"].astype(int)
@@ -1536,6 +2074,9 @@ def detect_sce(
     ends_by_chrom = chrom_ends or {}
     cell_depth_refs = (
         _cell_homozygous_depth_refs(work, none_bins) if has_depth else {}
+    )
+    bin_rel, cell_scale = (
+        _bin_coverage_reference(work, none_bins) if has_depth else ({}, {})
     )
 
     single_records: list[dict[str, object]] = []
@@ -1565,6 +2106,12 @@ def detect_sce(
         raw_classes = segments["class"].tolist()
         raw_c = segments["c"].tolist() if has_depth else None
         raw_w = segments["w"].tolist() if has_depth else None
+        scale = cell_scale.get((str(sample), str(cell)), 0.0)
+        raw_expected = (
+            [bin_rel.get((chrom_key, start), 0.0) * scale for start in raw_starts]
+            if scale > 0
+            else None
+        )
 
         male_chrx = _is_male_chrx(chrom_key, sex)
         allowed_classes = MALE_X_VALID_CLASSES if male_chrx else VALID_CLASSES
@@ -1599,6 +2146,8 @@ def detect_sce(
                 starts,
                 ends,
                 ref_depth=ref_depth,
+                raw_expected=raw_expected,
+                chrom_tot_ratio=wc_chrom_tot_ratio,
                 raw_starts=raw_starts,
                 raw_ends=raw_ends,
                 raw_classes=raw_classes,
@@ -1614,11 +2163,61 @@ def detect_sce(
             classes, starts, ends, skip_sv
         )
 
+        if (
+            has_depth
+            and classes
+            and ref_depth > 0
+            and raw_c is not None
+            and raw_w is not None
+        ):
+            classes, starts, ends = _drop_lopsided_wc_islands(
+                classes,
+                starts,
+                ends,
+                ref_depth=ref_depth,
+                raw_starts=raw_starts,
+                raw_ends=raw_ends,
+                raw_classes=raw_classes,
+                raw_c=[float(x) for x in raw_c],
+                raw_w=[float(x) for x in raw_w],
+                strong_balance=wc_island_strong_balance,
+                long_len_bp=wc_island_long_len_bp,
+                long_balance=wc_island_long_balance,
+                min_tot_ratio=wc_island_min_tot_ratio,
+                halved_ratio=wc_island_halved_ratio,
+                halved_min_balance=wc_island_halved_min_balance,
+                flank_bins=wc_dup_flank_bins,
+            )
+            classes, starts, ends = _drop_short_homozygous_islands(
+                classes,
+                starts,
+                ends,
+                raw_starts=raw_starts,
+                raw_ends=raw_ends,
+                raw_c=[float(x) for x in raw_c],
+                raw_w=[float(x) for x in raw_w],
+                min_len_bp=homo_island_min_len_bp,
+                min_tot_ratio=homo_island_min_tot_ratio,
+            )
+
         # Detect A-B-A / two-step-opposite on the full chromosome.
         classes, starts, ends, aba_duals = _extract_aba_sandwiches(
-            classes, starts, ends, barriers=barriers, male_chrx=male_chrx
+            classes,
+            starts,
+            ends,
+            barriers=barriers,
+            raw_starts=raw_starts,
+            raw_ends=raw_ends,
+            raw_classes=raw_classes,
+            skip_sv=skip_sv,
+            inv_intervals=[
+                (start, end)
+                for start, end, name in sv_raw
+                if _is_inversion_call(name)
+            ],
+            male_chrx=male_chrx,
         )
-        for left_bp, right_bp, spans_centromere, kind in aba_duals:
+        for left_bp, right_bp, spans_centromere, kind, sv_inv in aba_duals:
             dual_records.append(
                 {
                     "Sample": sample,
@@ -1628,6 +2227,7 @@ def detect_sce(
                     "end": right_bp,
                     "spans_centromere": spans_centromere,
                     "kind": kind,
+                    "sv_inversion": sv_inv,
                 }
             )
 
@@ -1680,6 +2280,7 @@ def detect_sce(
             "end",
             "spans_centromere",
             "kind",
+            "sv_inversion",
         ],
     )
     resolved_duals = resolve_double_switch_patterns(
@@ -1800,7 +2401,7 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=DEFAULT_WC_DUP_TOT_RATIO,
         help=(
-            "Dup-like WC: require (mean c+w)/flank_dom >= this "
+            "Dup-like WC: require (median c+w)/flank_dom >= this "
             f"(default: {DEFAULT_WC_DUP_TOT_RATIO}; 0 disables WC-dup filter)"
         ),
     )
@@ -1829,6 +2430,89 @@ def parse_args() -> argparse.Namespace:
         help=(
             "Homozygous flank bins per side for WC dup depth "
             f"(default: {DEFAULT_WC_DUP_FLANK_BINS})"
+        ),
+    )
+    parser.add_argument(
+        "--wc-chrom-tot-ratio",
+        type=float,
+        default=DEFAULT_WC_CHROM_TOT_RATIO,
+        help=(
+            "Drop WC if median (c+w) > expected coverage × this "
+            f"(default: {DEFAULT_WC_CHROM_TOT_RATIO}; 0 disables coverage ceiling)"
+        ),
+    )
+    parser.add_argument(
+        "--wc-island-strong-balance",
+        type=float,
+        default=DEFAULT_WC_ISLAND_STRONG_BALANCE,
+        help=(
+            "A-WC-A island: keep when min(c,w)/max(c,w) >= this "
+            f"(default: {DEFAULT_WC_ISLAND_STRONG_BALANCE}; 0 disables island filter)"
+        ),
+    )
+    parser.add_argument(
+        "--wc-island-long-len",
+        type=int,
+        default=DEFAULT_WC_ISLAND_LONG_LEN_BP,
+        help=(
+            "A-WC-A island: length in bp that qualifies for the relaxed balance "
+            f"(default: {DEFAULT_WC_ISLAND_LONG_LEN_BP})"
+        ),
+    )
+    parser.add_argument(
+        "--wc-island-long-balance",
+        type=float,
+        default=DEFAULT_WC_ISLAND_LONG_BALANCE,
+        help=(
+            "A-WC-A island: relaxed balance for a long island "
+            f"(default: {DEFAULT_WC_ISLAND_LONG_BALANCE})"
+        ),
+    )
+    parser.add_argument(
+        "--wc-island-min-tot-ratio",
+        type=float,
+        default=DEFAULT_WC_ISLAND_MIN_TOT_RATIO,
+        help=(
+            "A-WC-A island: keep when (c+w) < flank_dom × this "
+            f"(default: {DEFAULT_WC_ISLAND_MIN_TOT_RATIO})"
+        ),
+    )
+    parser.add_argument(
+        "--wc-island-halved-ratio",
+        type=float,
+        default=DEFAULT_WC_ISLAND_HALVED_RATIO,
+        help=(
+            "A-WC-A island: keep when the flank-dominant strand inside the "
+            "island is <= deeper flank x this "
+            f"(default: {DEFAULT_WC_ISLAND_HALVED_RATIO}; 0 disables the escape)"
+        ),
+    )
+    parser.add_argument(
+        "--wc-island-halved-min-balance",
+        type=float,
+        default=DEFAULT_WC_ISLAND_HALVED_MIN_BALANCE,
+        help=(
+            "A-WC-A island: minimum balance required by the halved-strand "
+            f"escape (default: {DEFAULT_WC_ISLAND_HALVED_MIN_BALANCE})"
+        ),
+    )
+    parser.add_argument(
+        "--homo-island-min-len",
+        type=int,
+        default=DEFAULT_HOMO_ISLAND_MIN_LEN_BP,
+        help=(
+            "WC-A-WC island: drop a homozygous island shorter than this (bp) "
+            "when it is also depth-dropped "
+            f"(default: {DEFAULT_HOMO_ISLAND_MIN_LEN_BP}; 0 disables)"
+        ),
+    )
+    parser.add_argument(
+        "--homo-island-min-tot-ratio",
+        type=float,
+        default=DEFAULT_HOMO_ISLAND_MIN_TOT_RATIO,
+        help=(
+            "WC-A-WC island: keep when island median (c+w) >= deeper flanking "
+            f"WC run x this (default: {DEFAULT_HOMO_ISLAND_MIN_TOT_RATIO})"
         ),
     )
     return parser.parse_args()
@@ -1878,6 +2562,15 @@ def main() -> None:
         wc_dup_max_strand_ratio=args.wc_dup_max_strand_ratio,
         wc_dup_min_strand_ratio=args.wc_dup_min_strand_ratio,
         wc_dup_flank_bins=args.wc_dup_flank_bins,
+        wc_chrom_tot_ratio=args.wc_chrom_tot_ratio,
+        wc_island_strong_balance=args.wc_island_strong_balance,
+        wc_island_long_len_bp=args.wc_island_long_len,
+        wc_island_long_balance=args.wc_island_long_balance,
+        wc_island_min_tot_ratio=args.wc_island_min_tot_ratio,
+        wc_island_halved_ratio=args.wc_island_halved_ratio,
+        wc_island_halved_min_balance=args.wc_island_halved_min_balance,
+        homo_island_min_len_bp=args.homo_island_min_len,
+        homo_island_min_tot_ratio=args.homo_island_min_tot_ratio,
     )
     write_excel(events, args.output)
     counts = events["Event"].value_counts()
