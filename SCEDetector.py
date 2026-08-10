@@ -59,6 +59,18 @@ DEFAULT_MIN_CENTRO_FLANK_BP = 5_000_000
 # so flanking states can merge instead of forming false SCE sandwiches.
 DEFAULT_MAX_SV_EDGE_STUB_BINS = 2
 DEFAULT_BIN_BP = 200_000
+# Runs merged across SV holes can look long by genomic span while almost
+# nothing remains after the skip. If kept length is small and the hole is
+# larger than the kept sequence, drop the remnant so it cannot seed an SCE.
+# WC scraps (e.g. G81 chr1) use a looser kept cap; WW/CC scraps (e.g. C19
+# chr4, two bins around a del/inv block) use a 2-bin cap so solid short
+# homozygous flanks on M are untouched. Solid flanks with kept≈span stay.
+DEFAULT_MAX_SV_SPARSE_WC_KEPT_BP = 2_000_000
+DEFAULT_MAX_SV_SPARSE_HOMO_KEPT_BP = 800_000
+# When an abutting homozygous flank is missing at a WC edge (SV/None hole),
+# scan at most this many raw bins beyond the gap for the nearest WW/CC run
+# before falling back to the cell-wide homozygous depth.
+DEFAULT_WC_DUP_FLANK_GAP_SCAN_BINS = 500
 # Drop WC as duplication-like when (vs local homozygous flank dominant depth
 # ``dom``): max(c,w)/dom, min(c,w)/dom, and (c+w)/dom all clear thresholds.
 # True WC ≈ both strands ~0.5×dom and tot~dom; unmarked dup often keeps one
@@ -93,11 +105,47 @@ DEFAULT_WC_ISLAND_BETWEEN_MAX_LEN_BP = 5_000_000
 DEFAULT_WC_ISLAND_BETWEEN_BALANCE = 0.55
 DEFAULT_WC_ISLAND_BETWEEN_MIN_HALVED = 0.55
 DEFAULT_WC_ISLAND_BETWEEN_MIN_MINOR = 0.45
+# Ultra-short WC scrap between identical homozygous flanks (CC-WC-CC /
+# WW-WC-WW): after large SV masking a ≤1 Mb WC remnant can seed a nonsense
+# ABA dual (e.g. T3 A27 chr5 @50.8/51.0). Lopsided-island rules leave these
+# alone when depth is depleted. Require a large flank gap that is almost
+# fully tiled by SV skip (cen-only / depth-carved holes like M G52 chr1 are
+# left alone so the ABA inversion sandwich survives).
+DEFAULT_ULTRA_SHORT_WC_ISLAND_MAX_LEN_BP = 1_000_000
+DEFAULT_ULTRA_SHORT_WC_ISLAND_MIN_FLANK_GAP_BP = 10_000_000
+DEFAULT_ULTRA_SHORT_WC_ISLAND_MAX_GAP_UNCOVERED_BP = 1_000_000
 # Mirror case: a homozygous island inside a WC run (WC-WW-WC / WC-CC-WC). Two
 # exchanges only a few Mb apart are implausible, and a real one would stay
 # depth-neutral, so drop only when the island is both short and depth-dropped.
 DEFAULT_HOMO_ISLAND_MIN_LEN_BP = 5_000_000
 DEFAULT_HOMO_ISLAND_MIN_TOT_RATIO = 0.80
+# Longer WC-A-WC homozygous islands that still look like deletions: overlap a
+# deletion SV call and sit below the flanking WC total-depth ratio. No length
+# cap (unlike the short-island rule), so cases like C21 chr7 (6 Mb CC over
+# del_h1) are cleared without touching length-only near misses on M (e.g. G49).
+DEFAULT_DEL_BACKED_HOMO_MIN_TOT_RATIO = 0.80
+DEFAULT_DEL_BACKED_HOMO_MIN_DEL_FRAC = 0.20
+# Softer deletion-cover bar for islands that are already deeply depleted
+# (e.g. C81 chr5: 13 Mb WW, del_frac≈0.15, depth≈0.33× flank). Milder
+# depth drops still need the stricter 0.20 cover (keeps C89 chr13).
+DEFAULT_DEL_BACKED_HOMO_SOFT_DEL_FRAC = 0.15
+DEFAULT_DEL_BACKED_HOMO_SOFT_TOT_RATIO = 0.40
+# Terminal homozygous tip (exactly WC–(WW|CC) or (WW|CC)–WC, tip-reaching):
+# drop when shallow vs the WC flank and a deletion starts near the junction
+# inside the tip. Targets deletion-looking q-terminal WW (e.g. C25 chr11)
+# without touching multi-run chromosomes or depth-neutral true tip SCEs.
+DEFAULT_DEL_BACKED_HOMO_TIP_MIN_TOT_RATIO = 0.70
+DEFAULT_DEL_BACKED_HOMO_TIP_MIN_DEL_FRAC = 0.10
+DEFAULT_DEL_BACKED_HOMO_TIP_MAX_DEL_GAP_BP = 2_000_000
+# Short tip without a local deletion call: still drop when the homozygous tip
+# is compact and at/below the WC flank depth bar (e.g. C86 chr1 pter WW
+# ~10 Mb, ratio 0.70). Longer shallow tips stay — they often are real SCEs.
+DEFAULT_SHALLOW_HOMO_TIP_MAX_LEN_BP = 15_000_000
+DEFAULT_SHALLOW_HOMO_TIP_MAX_TOT_RATIO = 0.70
+# Acrocentric q-proximal homozygous stub after p/cen masking: a few bins of
+# WW/CC then a long WC look like an SCE but are almost always mask edge noise
+# (e.g. C86 chr14 CC 20.6–21.2). Cap is tight so real arm-scale tip SCEs stay.
+DEFAULT_ACRO_LEAD_HOMO_STUB_MAX_LEN_BP = 1_000_000
 # An A-B-A sandwich that is really one heterozygous inversion whose SV call
 # stopped short: exactly one inversion call inside the sandwich, covering at
 # least this fraction of it. Several scattered inversion calls inside a long
@@ -629,6 +677,22 @@ def _run_touches_sv(
     return False
 
 
+def _run_kept_bp(
+    classes: list[str],
+    starts: list[int],
+    ends: list[int],
+    run_cls: str,
+    run_start: int,
+    run_end: int,
+) -> int:
+    """Sum of kept bin lengths inside a merged run (ignores genomic holes)."""
+    return sum(
+        end - start
+        for cls, start, end in zip(classes, starts, ends)
+        if cls == run_cls and start >= run_start and end <= run_end
+    )
+
+
 def _drop_sv_adjacent_stubs(
     classes: list[str],
     starts: list[int],
@@ -656,6 +720,72 @@ def _drop_sv_adjacent_stubs(
             if end - start > max_stub_bp:
                 continue
             if not _run_touches_sv(start, end, skip_sv):
+                continue
+            drop_start, drop_end = start, end
+            break
+        if drop_start is None or drop_end is None:
+            break
+        kept = [
+            (cls, start, end)
+            for cls, start, end in zip(classes, starts, ends)
+            if end <= drop_start or start >= drop_end
+        ]
+        if len(kept) == len(classes):
+            break
+        classes = [item[0] for item in kept]
+        starts = [item[1] for item in kept]
+        ends = [item[2] for item in kept]
+
+    return classes, starts, ends
+
+
+def _drop_sv_sparse_wc_remainders(
+    classes: list[str],
+    starts: list[int],
+    ends: list[int],
+    skip_sv: list[tuple[int, int]],
+    max_kept_bp: int = DEFAULT_MAX_SV_SPARSE_WC_KEPT_BP,
+    max_homo_kept_bp: int = DEFAULT_MAX_SV_SPARSE_HOMO_KEPT_BP,
+) -> tuple[list[str], list[int], list[int]]:
+    """
+    Drop state remnants that are mostly SV hole after the skip mask.
+
+    ``_merge_runs`` reports genomic ``start``/``end`` across skipped bins, so a
+    scrap on either side of a del/idup/inv block can look long enough to seed
+    an SCE even though almost no kept sequence remains. Require all of:
+
+    - the run touches an SV skip interval
+    - kept bin length (sum of bin widths) ≤ class cap
+      (``max_kept_bp`` for WC, ``max_homo_kept_bp`` for WW/CC)
+    - genomic hole (span − kept) is strictly larger than kept
+
+    Solid short flanks with kept≈span are retained.
+    """
+    if not skip_sv or not classes:
+        return classes, starts, ends
+    if max_kept_bp <= 0 and max_homo_kept_bp <= 0:
+        return classes, starts, ends
+
+    while True:
+        runs = _merge_runs(classes, starts, ends)
+        drop_start: int | None = None
+        drop_end: int | None = None
+        for cls, start, end in runs:
+            if cls == "WC":
+                cap = max_kept_bp
+            elif cls in {"WW", "CC"}:
+                cap = max_homo_kept_bp
+            else:
+                continue
+            if cap <= 0:
+                continue
+            if not _run_touches_sv(start, end, skip_sv):
+                continue
+            kept_bp = _run_kept_bp(classes, starts, ends, cls, start, end)
+            if kept_bp > cap:
+                continue
+            hole_bp = (end - start) - kept_bp
+            if hole_bp <= kept_bp:
                 continue
             drop_start, drop_end = start, end
             break
@@ -876,24 +1006,25 @@ def _homozygous_flank_dom(
     raw_w: list[float],
     *,
     max_bins: int,
+    across_gaps: bool = False,
+    gap_scan_bins: int = DEFAULT_WC_DUP_FLANK_GAP_SCAN_BINS,
 ) -> float | None:
     """
-    Median dominant-strand depth of the homozygous run abutting a WC interval.
+    Median dominant-strand depth of the homozygous run flanking a WC interval.
 
     ``side`` ``"L"`` uses bins immediately before ``wc_start``; ``"R"`` uses
     bins immediately after ``wc_end``. WW → ``w``, CC → ``c``.
+
+    When ``across_gaps`` is True and no homozygous run abuts the edge (common
+    when an SV/None hole sits between a kept WC scrap and the real flank),
+    scan up to ``gap_scan_bins`` raw bins beyond the gap for the nearest
+    WW/CC run. Island filters keep the strict abut-only behaviour.
     """
     n = len(raw_classes)
     if n == 0 or max_bins <= 0:
         return None
-    if side == "L":
-        j = None
-        for idx, end in enumerate(raw_ends):
-            if end == wc_start:
-                j = idx
-                break
-        if j is None:
-            return None
+
+    def _collect_left(j: int) -> float | None:
         cls = raw_classes[j]
         if cls not in {"WW", "CC"}:
             return None
@@ -903,26 +1034,75 @@ def _homozygous_flank_dom(
             if j == 0 or raw_ends[j - 1] != raw_starts[j]:
                 break
             j -= 1
-    else:
-        j = None
-        for idx, start in enumerate(raw_starts):
-            if start == wc_end:
-                j = idx
-                break
-        if j is None:
-            return None
+        return _median(vals) if vals else None
+
+    def _collect_right(j: int) -> float | None:
         cls = raw_classes[j]
         if cls not in {"WW", "CC"}:
             return None
-        vals = []
+        vals: list[float] = []
         while j < n and raw_classes[j] == cls and len(vals) < max_bins:
             vals.append(raw_w[j] if cls == "WW" else raw_c[j])
             if j + 1 >= n or raw_ends[j] != raw_starts[j + 1]:
                 break
             j += 1
-    if not vals:
+        return _median(vals) if vals else None
+
+    if side == "L":
+        j = None
+        for idx, end in enumerate(raw_ends):
+            if end == wc_start:
+                j = idx
+                break
+        if j is not None:
+            got = _collect_left(j)
+            if got is not None:
+                return got
+        if not across_gaps or gap_scan_bins <= 0:
+            return None
+        # Nearest bin ending at or before the WC edge, then walk left.
+        j = None
+        for idx in range(n - 1, -1, -1):
+            if raw_ends[idx] <= wc_start:
+                j = idx
+                break
+        if j is None:
+            return None
+        scanned = 0
+        while j >= 0 and scanned < gap_scan_bins:
+            got = _collect_left(j)
+            if got is not None:
+                return got
+            j -= 1
+            scanned += 1
         return None
-    return _median(vals)
+
+    j = None
+    for idx, start in enumerate(raw_starts):
+        if start == wc_end:
+            j = idx
+            break
+    if j is not None:
+        got = _collect_right(j)
+        if got is not None:
+            return got
+    if not across_gaps or gap_scan_bins <= 0:
+        return None
+    j = None
+    for idx, start in enumerate(raw_starts):
+        if start >= wc_end:
+            j = idx
+            break
+    if j is None:
+        return None
+    scanned = 0
+    while j < n and scanned < gap_scan_bins:
+        got = _collect_right(j)
+        if got is not None:
+            return got
+        j += 1
+        scanned += 1
+    return None
 
 
 def _is_duplication_like_wc_depth(
@@ -990,11 +1170,13 @@ def _drop_duplication_like_wc(
 
     WC depth uses the full contiguous raw WC run (including None-masked bins),
     with median ``c``/``w``. Dominant flank depth ``dom`` is the median
-    WW-``w`` / CC-``c`` of abutting homozygous runs (up to ``flank_bins`` each
+    WW-``w`` / CC-``c`` of flanking homozygous runs (up to ``flank_bins`` each
     side; average of side medians if both sides), floored by the cell-wide
     homozygous median ``ref_depth`` so shallow peri-centromere / noisy flanks
-    do not inflate ratios. If no homozygous flank exists, use ``ref_depth``
-    alone.
+    do not inflate ratios. Flanks may be taken across an SV/None gap when no
+    homozygous run abuts the kept WC edge; otherwise a shallow cell-wide
+    ``ref_depth`` fallback falsely flags copy-neutral WC next to holes. If no
+    homozygous flank exists even across gaps, use ``ref_depth`` alone.
 
     Also drop when WC total ``c+w`` exceeds ``chrom_tot_ratio`` × the run's
     expected coverage from ``raw_expected`` (per-bin cross-cell reference).
@@ -1060,6 +1242,7 @@ def _drop_duplication_like_wc(
                         raw_c,
                         raw_w,
                         max_bins=flank_bins,
+                        across_gaps=True,
                     ),
                     _homozygous_flank_dom(
                         "R",
@@ -1071,6 +1254,7 @@ def _drop_duplication_like_wc(
                         raw_c,
                         raw_w,
                         max_bins=flank_bins,
+                        across_gaps=True,
                     ),
                 )
                 if d is not None and d > 0
@@ -1240,6 +1424,92 @@ def _drop_lopsided_wc_islands(
     return classes, starts, ends
 
 
+def _gap_uncovered_bp(
+    lo: int, hi: int, skip_sv: list[tuple[int, int]]
+) -> int:
+    """Genomic bases in ``[lo, hi)`` not covered by any SV skip interval."""
+    if hi <= lo:
+        return 0
+    covered = 0
+    for a, b in skip_sv:
+        if b <= lo or a >= hi:
+            continue
+        covered += min(b, hi) - max(a, lo)
+    return max(0, (hi - lo) - covered)
+
+
+def _drop_ultra_short_wc_islands(
+    classes: list[str],
+    starts: list[int],
+    ends: list[int],
+    skip_sv: list[tuple[int, int]] | None = None,
+    max_len_bp: int = DEFAULT_ULTRA_SHORT_WC_ISLAND_MAX_LEN_BP,
+    min_flank_gap_bp: int = DEFAULT_ULTRA_SHORT_WC_ISLAND_MIN_FLANK_GAP_BP,
+    max_gap_uncovered_bp: int = DEFAULT_ULTRA_SHORT_WC_ISLAND_MAX_GAP_UNCOVERED_BP,
+) -> tuple[list[str], list[int], list[int]]:
+    """
+    Drop ultra-short WC islands wedged between identical homozygous runs
+    when a large SV-tiled hole separates the island from a flank.
+
+    Targets leftovers such as ``CC – [SV hole] – WC(≤1 Mb) – CC`` that
+    survive the lopsided-island filter because they are depth-depleted.
+    Gaps that are mostly *not* SV (depth-carved WC collapse, cen-only) are
+    kept so ABA inversion sandwiches like M G52/G57 chr1 stay intact.
+    """
+    if not classes or max_len_bp <= 0:
+        return classes, starts, ends
+    skip_sv = skip_sv or []
+    if not skip_sv:
+        return classes, starts, ends
+
+    while True:
+        runs = _merge_runs(classes, starts, ends)
+        drop_start: int | None = None
+        drop_end: int | None = None
+        for k in range(1, len(runs) - 1):
+            cls, start, end = runs[k]
+            if cls != "WC":
+                continue
+            left, right = runs[k - 1][0], runs[k + 1][0]
+            if left != right or left not in {"WW", "CC"}:
+                continue
+            if end - start > max_len_bp:
+                continue
+            left_gap = start - runs[k - 1][2]
+            right_gap = runs[k + 1][1] - end
+            sv_hole = False
+            if left_gap >= min_flank_gap_bp:
+                if (
+                    _gap_uncovered_bp(runs[k - 1][2], start, skip_sv)
+                    <= max_gap_uncovered_bp
+                ):
+                    sv_hole = True
+            if right_gap >= min_flank_gap_bp:
+                if (
+                    _gap_uncovered_bp(end, runs[k + 1][1], skip_sv)
+                    <= max_gap_uncovered_bp
+                ):
+                    sv_hole = True
+            if not sv_hole:
+                continue
+            drop_start, drop_end = start, end
+            break
+        if drop_start is None or drop_end is None:
+            break
+        kept = [
+            (cls, start, end)
+            for cls, start, end in zip(classes, starts, ends)
+            if end <= drop_start or start >= drop_end
+        ]
+        if len(kept) == len(classes):
+            break
+        classes = [item[0] for item in kept]
+        starts = [item[1] for item in kept]
+        ends = [item[2] for item in kept]
+
+    return classes, starts, ends
+
+
 def _run_median_total(
     start: int,
     end: int,
@@ -1276,8 +1546,9 @@ def _drop_short_homozygous_islands(
     only a few Mb apart on an otherwise fully heterozygous chromosome are
     implausible, and a genuine pair would leave total depth unchanged across the
     island. Drop only when the island is shorter than ``min_len_bp`` *and* its
-    median ``c+w`` falls below ``min_tot_ratio`` × the deeper flanking WC run,
-    so depth-neutral short islands are left alone.
+    median ``c+w`` falls below ``min_tot_ratio`` × the deeper flanking WC run
+    *and* below the shallower flank (so an island that is deeper than one WC
+    side, e.g. C91 chr11 CC 109.4–113.4, is not treated as depleted).
     """
     if not classes or min_len_bp <= 0:
         return classes, starts, ends
@@ -1321,6 +1592,10 @@ def _drop_short_homozygous_islands(
                 continue
             if island >= max(flanks) * min_tot_ratio:
                 continue
+            # Must also sit below the shallower WC flank; otherwise uneven
+            # flanks alone can look like a "drop" vs the deeper side only.
+            if island >= min(flanks):
+                continue
             drop_start, drop_end = start, end
             break
         if drop_start is None or drop_end is None:
@@ -1337,6 +1612,305 @@ def _drop_short_homozygous_islands(
         ends = [item[2] for item in kept]
 
     return classes, starts, ends
+
+
+def _deletion_overlap_fraction(
+    start: int, end: int, sv_raw: list[tuple[int, int, str]]
+) -> float:
+    """Fraction of [start, end) covered by deletion SV calls."""
+    if end <= start or not sv_raw:
+        return 0.0
+    covered = 0
+    for a, b, name in sv_raw:
+        if not _is_deletion_call(name):
+            continue
+        covered += max(0, min(end, b) - max(start, a))
+    return covered / (end - start)
+
+
+def _drop_deletion_backed_homozygous_islands(
+    classes: list[str],
+    starts: list[int],
+    ends: list[int],
+    *,
+    raw_starts: list[int],
+    raw_ends: list[int],
+    raw_c: list[float],
+    raw_w: list[float],
+    sv_raw: list[tuple[int, int, str]],
+    min_tot_ratio: float = DEFAULT_DEL_BACKED_HOMO_MIN_TOT_RATIO,
+    min_del_frac: float = DEFAULT_DEL_BACKED_HOMO_MIN_DEL_FRAC,
+    soft_del_frac: float = DEFAULT_DEL_BACKED_HOMO_SOFT_DEL_FRAC,
+    soft_tot_ratio: float = DEFAULT_DEL_BACKED_HOMO_SOFT_TOT_RATIO,
+) -> tuple[list[str], list[int], list[int]]:
+    """
+    Drop WC-A-WC homozygous islands that are deletion-backed and depth-dropped.
+
+    Unlike ``_drop_short_homozygous_islands``, there is no length cap. Require
+    ``WC – (WW|CC) – WC`` and either:
+
+    - deletion covers ≥ ``min_del_frac`` and island ``c+w`` < ``min_tot_ratio``
+      × deeper WC flank, or
+    - deletion covers ≥ ``soft_del_frac`` and island ``c+w`` < ``soft_tot_ratio``
+      × deeper WC flank (deeply depleted islands with a smaller deletion call)
+
+    This targets shallow CC/WW blocks sitting on called deletions (e.g. C21
+    chr7; C81 chr5) without removing length-similar islands that lack
+    deletion support.
+    """
+    if not classes or not sv_raw or min_tot_ratio <= 0 or min_del_frac <= 0:
+        return classes, starts, ends
+
+    while True:
+        runs = _merge_runs(classes, starts, ends)
+        drop_start: int | None = None
+        drop_end: int | None = None
+        for k in range(1, len(runs) - 1):
+            cls, start, end = runs[k]
+            if cls == "WC" or runs[k - 1][0] != "WC" or runs[k + 1][0] != "WC":
+                continue
+            del_frac = _deletion_overlap_fraction(start, end, sv_raw)
+            if del_frac < min(min_del_frac, soft_del_frac):
+                continue
+            island = _run_median_total(
+                start, end, raw_starts, raw_ends, raw_c, raw_w
+            )
+            flanks = [
+                t
+                for t in (
+                    _run_median_total(
+                        runs[k - 1][1],
+                        runs[k - 1][2],
+                        raw_starts,
+                        raw_ends,
+                        raw_c,
+                        raw_w,
+                    ),
+                    _run_median_total(
+                        runs[k + 1][1],
+                        runs[k + 1][2],
+                        raw_starts,
+                        raw_ends,
+                        raw_c,
+                        raw_w,
+                    ),
+                )
+                if t is not None and t > 0
+            ]
+            if island is None or not flanks:
+                continue
+            deeper = max(flanks)
+            standard = (
+                del_frac >= min_del_frac and island < deeper * min_tot_ratio
+            )
+            soft = (
+                soft_del_frac > 0
+                and soft_tot_ratio > 0
+                and del_frac >= soft_del_frac
+                and island < deeper * soft_tot_ratio
+            )
+            if not (standard or soft):
+                continue
+            drop_start, drop_end = start, end
+            break
+        if drop_start is None or drop_end is None:
+            break
+        kept = [
+            (cls, start, end)
+            for cls, start, end in zip(classes, starts, ends)
+            if end <= drop_start or start >= drop_end
+        ]
+        if len(kept) == len(classes):
+            break
+        classes = [item[0] for item in kept]
+        starts = [item[1] for item in kept]
+        ends = [item[2] for item in kept]
+
+    return classes, starts, ends
+
+
+def _drop_deletion_backed_homozygous_tips(
+    classes: list[str],
+    starts: list[int],
+    ends: list[int],
+    *,
+    raw_starts: list[int],
+    raw_ends: list[int],
+    raw_c: list[float],
+    raw_w: list[float],
+    sv_raw: list[tuple[int, int, str]],
+    chrom_end: int | None,
+    male_chrx: bool = False,
+    min_tot_ratio: float = DEFAULT_DEL_BACKED_HOMO_TIP_MIN_TOT_RATIO,
+    min_del_frac: float = DEFAULT_DEL_BACKED_HOMO_TIP_MIN_DEL_FRAC,
+    max_del_gap_bp: int = DEFAULT_DEL_BACKED_HOMO_TIP_MAX_DEL_GAP_BP,
+    tip_slack_bp: int = DEFAULT_TELOMERE_SV_SLACK_BP,
+    shallow_max_len_bp: int = DEFAULT_SHALLOW_HOMO_TIP_MAX_LEN_BP,
+    shallow_max_tot_ratio: float = DEFAULT_SHALLOW_HOMO_TIP_MAX_TOT_RATIO,
+) -> tuple[list[str], list[int], list[int]]:
+    """
+    Drop tip-reaching homozygous runs that look like terminal deletions.
+
+    Two paths (male chrX skipped on both):
+
+    1. **Deletion-backed (two-run only):** ``WC – (WW|CC)`` / ``(WW|CC) – WC``
+       with the tip abutting WC, tip ``c+w`` < ``min_tot_ratio`` × WC flank,
+       cumulative deletion cover ≥ ``min_del_frac`` of the tip, and at least
+       one deletion within ``max_del_gap_bp`` of the junction (long tips with
+       many small dels, e.g. C90 chr2). A masked gap between tip and WC is
+       left alone (downstream SCE/translocation may still be real).
+
+    2. **Short shallow tip (any run count):** tip length ≤ ``shallow_max_len_bp``
+       and tip ``c+w`` ≤ ``shallow_max_tot_ratio`` × WC flank, even without a
+       local deletion call (e.g. C86 chr1 pter WW before a WW→WC→CC twostep).
+    """
+    if male_chrx or not classes:
+        return classes, starts, ends
+
+    runs = _merge_runs(classes, starts, ends)
+    if len(runs) < 2:
+        return classes, starts, ends
+
+    drop_start: int | None = None
+    drop_end: int | None = None
+
+    tip_specs = ((1, 0, "qter"), (0, 1, "pter")) if len(runs) == 2 else (
+        (-1, -2, "qter"),
+        (0, 1, "pter"),
+    )
+
+    for tip_idx, flank_idx, side in tip_specs:
+        tip_cls, tip_start, tip_end = runs[tip_idx]
+        flank_cls, flank_start, flank_end = runs[flank_idx]
+        if tip_cls == "WC" or flank_cls != "WC":
+            continue
+        if side == "qter":
+            if chrom_end is None or chrom_end - tip_end > tip_slack_bp:
+                continue
+        elif tip_start > tip_slack_bp:
+            continue
+
+        tip_tot = _run_median_total(
+            tip_start, tip_end, raw_starts, raw_ends, raw_c, raw_w
+        )
+        flank_tot = _run_median_total(
+            flank_start, flank_end, raw_starts, raw_ends, raw_c, raw_w
+        )
+        if tip_tot is None or flank_tot is None or flank_tot <= 0:
+            continue
+
+        tip_len = tip_end - tip_start
+        if tip_len <= 0:
+            continue
+
+        # Short shallow tip: no deletion required.
+        if (
+            shallow_max_len_bp > 0
+            and shallow_max_tot_ratio > 0
+            and tip_len <= shallow_max_len_bp
+            and tip_tot <= flank_tot * shallow_max_tot_ratio
+        ):
+            drop_start, drop_end = tip_start, tip_end
+            break
+
+        # Deletion-backed tip: only the simple two-run layout, tip abutting WC.
+        if (
+            len(runs) != 2
+            or not sv_raw
+            or min_tot_ratio <= 0
+            or min_del_frac <= 0
+            or max_del_gap_bp < 0
+            or tip_tot >= flank_tot * min_tot_ratio
+        ):
+            continue
+        if side == "qter" and tip_start != flank_end:
+            continue
+        if side == "pter" and tip_end != flank_start:
+            continue
+        if _deletion_overlap_fraction(tip_start, tip_end, sv_raw) < min_del_frac:
+            continue
+        near_junction = False
+        for del_start, del_end, name in sv_raw:
+            if not _is_deletion_call(name):
+                continue
+            if del_end <= tip_start or del_start >= tip_end:
+                continue
+            if side == "qter":
+                gap = max(0, del_start - tip_start)
+            else:
+                gap = max(0, tip_end - del_end)
+            if gap <= max_del_gap_bp:
+                near_junction = True
+                break
+        if near_junction:
+            drop_start, drop_end = tip_start, tip_end
+            break
+
+    if drop_start is None or drop_end is None:
+        return classes, starts, ends
+
+    kept = [
+        (cls, start, end)
+        for cls, start, end in zip(classes, starts, ends)
+        if end <= drop_start or start >= drop_end
+    ]
+    if len(kept) == len(classes):
+        return classes, starts, ends
+    return (
+        [item[0] for item in kept],
+        [item[1] for item in kept],
+        [item[2] for item in kept],
+    )
+
+
+def _drop_acrocentric_leading_homo_stubs(
+    classes: list[str],
+    starts: list[int],
+    ends: list[int],
+    *,
+    chrom: str,
+    max_len_bp: int = DEFAULT_ACRO_LEAD_HOMO_STUB_MAX_LEN_BP,
+) -> tuple[list[str], list[int], list[int]]:
+    """
+    Drop a short leading homozygous stub on acrocentric chromosomes.
+
+    After p-arm / centromere masking, acrocentric chromosomes often begin with
+    a few WW/CC bins then a long WC run. That edge stub is not a reliable SCE
+    (e.g. C86 chr14 CC 20.6–21.2). Require:
+
+    - first run is WW/CC shorter than ``max_len_bp``
+    - next run is WC and abuts the stub (no masked gap between them)
+
+    A stub separated from WC by a hole is left alone — those gaps can still
+    carry a real refined SCE further downstream.
+    """
+    if chrom not in ACROCENTRIC_CHROMS or not classes or max_len_bp <= 0:
+        return classes, starts, ends
+
+    runs = _merge_runs(classes, starts, ends)
+    if len(runs) < 2:
+        return classes, starts, ends
+    tip_cls, tip_start, tip_end = runs[0]
+    next_cls, next_start, _next_end = runs[1]
+    if tip_cls == "WC" or next_cls != "WC":
+        return classes, starts, ends
+    if tip_end - tip_start > max_len_bp:
+        return classes, starts, ends
+    if tip_end != next_start:
+        return classes, starts, ends
+
+    kept = [
+        (cls, start, end)
+        for cls, start, end in zip(classes, starts, ends)
+        if end <= tip_start or start >= tip_end
+    ]
+    if len(kept) == len(classes):
+        return classes, starts, ends
+    return (
+        [item[0] for item in kept],
+        [item[1] for item in kept],
+        [item[2] for item in kept],
+    )
 
 
 def _overlaps_any(start: int, end: int, intervals: list[tuple[int, int]]) -> bool:
@@ -2035,6 +2609,7 @@ def detect_sce(
     wc_island_min_tot_ratio: float = DEFAULT_WC_ISLAND_MIN_TOT_RATIO,
     wc_island_halved_ratio: float = DEFAULT_WC_ISLAND_HALVED_RATIO,
     wc_island_halved_min_balance: float = DEFAULT_WC_ISLAND_HALVED_MIN_BALANCE,
+    ultra_short_wc_island_max_len_bp: int = DEFAULT_ULTRA_SHORT_WC_ISLAND_MAX_LEN_BP,
     homo_island_min_len_bp: int = DEFAULT_HOMO_ISLAND_MIN_LEN_BP,
     homo_island_min_tot_ratio: float = DEFAULT_HOMO_ISLAND_MIN_TOT_RATIO,
 ) -> pd.DataFrame:
@@ -2055,9 +2630,11 @@ def detect_sce(
     coverage bands are not mistaken for gains. WC islands wedged between two
     identical homozygous runs are dropped when their strands are lopsided at
     near-flank total depth, and short depth-dropped homozygous islands inside a
-    WC run are dropped as well. A-B-A sandwiches are resolved by subclone
-    recurrence. Remaining single switches are scored per arm; a
-    centromere-crossing exception recovers masked single switches.
+    WC run are dropped as well. Tip-reaching homozygous runs in the simple
+    WC–homo two-run layout are dropped when shallow and deletion-backed near
+    the junction. A-B-A sandwiches are resolved by subclone recurrence.
+    Remaining single switches are scored per arm; a centromere-crossing
+    exception recovers masked single switches.
     """
     work = raw.copy()
     work["start"] = work["start"].astype(int)
@@ -2162,6 +2739,9 @@ def detect_sce(
         classes, starts, ends = _drop_sv_adjacent_stubs(
             classes, starts, ends, skip_sv
         )
+        classes, starts, ends = _drop_sv_sparse_wc_remainders(
+            classes, starts, ends, skip_sv
+        )
 
         if (
             has_depth
@@ -2199,6 +2779,42 @@ def detect_sce(
                 min_len_bp=homo_island_min_len_bp,
                 min_tot_ratio=homo_island_min_tot_ratio,
             )
+            classes, starts, ends = _drop_deletion_backed_homozygous_islands(
+                classes,
+                starts,
+                ends,
+                raw_starts=raw_starts,
+                raw_ends=raw_ends,
+                raw_c=[float(x) for x in raw_c],
+                raw_w=[float(x) for x in raw_w],
+                sv_raw=sv_raw,
+            )
+            classes, starts, ends = _drop_deletion_backed_homozygous_tips(
+                classes,
+                starts,
+                ends,
+                raw_starts=raw_starts,
+                raw_ends=raw_ends,
+                raw_c=[float(x) for x in raw_c],
+                raw_w=[float(x) for x in raw_w],
+                sv_raw=sv_raw,
+                chrom_end=chrom_end,
+                male_chrx=male_chrx,
+            )
+
+        classes, starts, ends = _drop_ultra_short_wc_islands(
+            classes,
+            starts,
+            ends,
+            skip_sv=skip_sv,
+            max_len_bp=ultra_short_wc_island_max_len_bp,
+            min_flank_gap_bp=DEFAULT_ULTRA_SHORT_WC_ISLAND_MIN_FLANK_GAP_BP,
+            max_gap_uncovered_bp=DEFAULT_ULTRA_SHORT_WC_ISLAND_MAX_GAP_UNCOVERED_BP,
+        )
+
+        classes, starts, ends = _drop_acrocentric_leading_homo_stubs(
+            classes, starts, ends, chrom=chrom_key
+        )
 
         # Detect A-B-A / two-step-opposite on the full chromosome.
         classes, starts, ends, aba_duals = _extract_aba_sandwiches(
