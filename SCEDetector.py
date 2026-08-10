@@ -130,6 +130,14 @@ DEFAULT_DEL_BACKED_HOMO_MIN_DEL_FRAC = 0.20
 # depth drops still need the stricter 0.20 cover (keeps C89 chr13).
 DEFAULT_DEL_BACKED_HOMO_SOFT_DEL_FRAC = 0.15
 DEFAULT_DEL_BACKED_HOMO_SOFT_TOT_RATIO = 0.40
+# Long WC-A-WC homozygous island with little/no deletion SV support: still drop
+# when depth is as depleted as the soft deletion-backed bar (≤0.40 × deeper
+# flank and below the shallower flank). Short islands already use the 0.80 bar
+# without SV; this closes the gap for long unmarked deletions. Tuned so no
+# current M/T1/T3 dual-SCE island (lowest ~0.47 × deeper) is removed.
+DEFAULT_LONG_SHALLOW_HOMO_MIN_LEN_BP = 5_000_000
+DEFAULT_LONG_SHALLOW_HOMO_MAX_TOT_RATIO = 0.40
+DEFAULT_LONG_SHALLOW_HOMO_MAX_DEL_FRAC = 0.15
 # Terminal homozygous tip (exactly WC–(WW|CC) or (WW|CC)–WC, tip-reaching):
 # drop when shallow vs the WC flank and a deletion starts near the junction
 # inside the tip. Targets deletion-looking q-terminal WW (e.g. C25 chr11)
@@ -1729,6 +1737,97 @@ def _drop_deletion_backed_homozygous_islands(
     return classes, starts, ends
 
 
+def _drop_long_shallow_homozygous_islands(
+    classes: list[str],
+    starts: list[int],
+    ends: list[int],
+    *,
+    raw_starts: list[int],
+    raw_ends: list[int],
+    raw_c: list[float],
+    raw_w: list[float],
+    sv_raw: list[tuple[int, int, str]],
+    min_len_bp: int = DEFAULT_LONG_SHALLOW_HOMO_MIN_LEN_BP,
+    max_tot_ratio: float = DEFAULT_LONG_SHALLOW_HOMO_MAX_TOT_RATIO,
+    max_del_frac: float = DEFAULT_LONG_SHALLOW_HOMO_MAX_DEL_FRAC,
+) -> tuple[list[str], list[int], list[int]]:
+    """
+    Drop long, deeply depleted WC-A-WC homozygous islands without del support.
+
+    Complements ``_drop_short_homozygous_islands`` (length < 5 Mb, milder
+    depth bar) and ``_drop_deletion_backed_homozygous_islands`` (needs a
+    deletion call). Require all of:
+
+    - island length >= ``min_len_bp``
+    - deletion cover < ``max_del_frac`` (otherwise the del-backed path applies)
+    - island ``c+w`` < ``max_tot_ratio`` x deeper WC flank
+    - island ``c+w`` < shallower WC flank
+    """
+    if not classes or min_len_bp <= 0 or max_tot_ratio <= 0:
+        return classes, starts, ends
+
+    while True:
+        runs = _merge_runs(classes, starts, ends)
+        drop_start: int | None = None
+        drop_end: int | None = None
+        for k in range(1, len(runs) - 1):
+            cls, start, end = runs[k]
+            if cls == "WC" or runs[k - 1][0] != "WC" or runs[k + 1][0] != "WC":
+                continue
+            if end - start < min_len_bp:
+                continue
+            del_frac = _deletion_overlap_fraction(start, end, sv_raw)
+            if del_frac >= max_del_frac:
+                continue
+            island = _run_median_total(
+                start, end, raw_starts, raw_ends, raw_c, raw_w
+            )
+            flanks = [
+                t
+                for t in (
+                    _run_median_total(
+                        runs[k - 1][1],
+                        runs[k - 1][2],
+                        raw_starts,
+                        raw_ends,
+                        raw_c,
+                        raw_w,
+                    ),
+                    _run_median_total(
+                        runs[k + 1][1],
+                        runs[k + 1][2],
+                        raw_starts,
+                        raw_ends,
+                        raw_c,
+                        raw_w,
+                    ),
+                )
+                if t is not None and t > 0
+            ]
+            if island is None or len(flanks) < 2:
+                continue
+            if island >= max(flanks) * max_tot_ratio:
+                continue
+            if island >= min(flanks):
+                continue
+            drop_start, drop_end = start, end
+            break
+        if drop_start is None or drop_end is None:
+            break
+        kept = [
+            (cls, start, end)
+            for cls, start, end in zip(classes, starts, ends)
+            if end <= drop_start or start >= drop_end
+        ]
+        if len(kept) == len(classes):
+            break
+        classes = [item[0] for item in kept]
+        starts = [item[1] for item in kept]
+        ends = [item[2] for item in kept]
+
+    return classes, starts, ends
+
+
 def _drop_deletion_backed_homozygous_tips(
     classes: list[str],
     starts: list[int],
@@ -2780,6 +2879,16 @@ def detect_sce(
                 min_tot_ratio=homo_island_min_tot_ratio,
             )
             classes, starts, ends = _drop_deletion_backed_homozygous_islands(
+                classes,
+                starts,
+                ends,
+                raw_starts=raw_starts,
+                raw_ends=raw_ends,
+                raw_c=[float(x) for x in raw_c],
+                raw_w=[float(x) for x in raw_w],
+                sv_raw=sv_raw,
+            )
+            classes, starts, ends = _drop_long_shallow_homozygous_islands(
                 classes,
                 starts,
                 ends,

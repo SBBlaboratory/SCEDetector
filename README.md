@@ -83,8 +83,8 @@ For each QC-passed cell × chromosome (`chrY` is used only to infer sex):
       (b)  Short stubs at SV hole edges
       (b′) Sparse remnants after large SV holes
       (c)  Lopsided A–WC–A WC islands
-      (c′) Ultra-short A–WC–A WC scraps in SV-tiled gaps
-      (d)  Short / deletion-backed WC–A–WC homozygous islands
+      (c′) Short A–WC–A WC scraps beside large SV-tiled gaps
+      (d)  Short / deletion-backed / long-shallow WC–A–WC homozygous islands
       (e)  Shallow homozygous tips (deletion-like)
       (f)  Short leading homozygous stubs on acrocentrics
         ↓
@@ -242,6 +242,17 @@ After masking, some runs still look like SCE switches but are better explained b
 
 Solid short flanks with `kept ≈ span` are retained.
 
+**How 2b / 2b′ / 2c′ differ** (easy to confuse — they all touch SV holes):
+
+| | 2b | 2b′ | 2c′ |
+|--|----|-----|-----|
+| Target | Any class | WC or WW/CC run | **A–WC–A only** (`WW-WC-WW` / `CC-WC-CC`) |
+| Length idea | ≤ **2 bins (0.4 Mb)** — shortest of the three | Small **kept** vs large **hole** (WC ≤2 Mb / homo ≤0.8 Mb) | WC ≤ **1 Mb** (can be longer than a 2b stub) |
+| Geometry | Touches SV | Touches SV and `hole > kept` | Flank gap ≥ **10 Mb** almost fully SV-tiled |
+| Role | Dust on the hole edge | Run that looks long only because it spans a hole | Fake dual-SCE from a short WC island after a huge SV desert |
+
+So “short” in 2c′ means short **relative to a real ABA WC island / dual-SCE spacing**, not shorter than 2b. A 0.6–1.0 Mb WC between identical flanks across an ~18 Mb SV gap is a 2c′ case that 2b misses (`>2` bins).
+
 ---
 
 #### 2c. Drop lopsided A–WC–A WC islands
@@ -260,9 +271,9 @@ Solid short flanks with `kept ≈ span` are retained.
 
 ---
 
-#### 2c′. Drop ultra-short WC scraps in large SV-tiled gaps
+#### 2c′. Drop short A–WC–A WC scraps beside large SV-tiled gaps
 
-**Biology.** After a multi-megabase SV/complex mask, a ≤1 Mb WC crumb can remain between identical homozygous flanks and invent a nonsense dual SCE a few hundred kb apart. Depth-depleted islands escape rule 2c (§3), so a separate length + geometry rule is needed.
+**Biology.** After a multi-megabase SV/complex mask, a short WC remnant (≤1 Mb) can remain between identical homozygous flanks and invent a nonsense dual SCE a few hundred kb apart. Depth-depleted islands escape rule 2c (keep when `(c+w) < 0.55 × dom`), so a separate **ABA + gap + SV-tiling** rule is needed. This is **not** “shorter than 2b”: 2b already removes ≤2-bin edge stubs; 2c′ targets short **WC islands** next to a **huge SV-tiled hole** (including 3–5 bin scraps that 2b leaves).
 
 **Drop `WW–WC–WW` / `CC–WC–CC` when all hold:**
 
@@ -270,7 +281,7 @@ Solid short flanks with `kept ≈ span` are retained.
 2. At least one flank gap ≥ **10 Mb**  
 3. That gap is almost fully tiled by SV skip (**uncovered ≤ 1 Mb**)  
 
-Depth-carved holes **without** SV tiling (for example inversion sandwiches where WC was trimmed by other filters) are **kept**, so true ABA inversion calls are not destroyed.
+Depth-carved holes **without** SV tiling (for example inversion sandwiches where WC was trimmed by other filters) are **kept**, so true ABA inversion calls are not destroyed. Overlap with 2b is possible when the WC scrap is also ≤2 bins; 2b runs earlier and usually clears those first.
 
 ---
 
@@ -289,7 +300,16 @@ Depth-carved holes **without** SV tiling (for example inversion sandwiches where
 1. Deletion SV covers ≥ **20%** of the island **and** island `(c+w) < deeper WC × 0.80`  
 2. Deletion SV covers ≥ **15%** **and** island `(c+w) < deeper WC × 0.40` (already deeply depleted)
 
-Depth-neutral short islands, or islands deeper than one WC flank, are kept.
+**Long shallow island without deletion support** — drop when all hold:
+
+1. Island length ≥ **5 Mb**  
+2. Deletion SV covers **< 15%** of the island (weak/no del call; otherwise the deletion-backed path applies)  
+3. Island `(c+w) < deeper WC × 0.40`  
+4. Island `(c+w) < shallower WC`
+
+This closes the gap where a long unmarked deletion-like island is too long for the short path and has no `del_*` call for the deletion-backed path. The depth bar matches the soft deletion-backed tier so only deeply depleted islands are removed.
+
+Depth-neutral islands, or islands deeper than one WC flank, are kept.
 
 ---
 
@@ -445,7 +465,7 @@ Practical caveats:
 
 - Calls remain **candidates**; always inspect depth and SV context for important events.  
 - Large duplications can erase a true nearby SCE if the whole WC block is dropped as duplication-like.  
-- Ultra-dense true dual SCEs (&lt;1 Mb) inside large SV holes are intentionally suppressed.  
+- True dual SCEs with WC ≤1 Mb beside a large SV-tiled hole are intentionally suppressed (rule 2c′).  
 - Thresholds were tuned on HPNE Strand-seq cohorts; new chemistries or bin sizes may need retuning.
 
 ---
