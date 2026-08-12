@@ -331,6 +331,15 @@ Depth-neutral islands, or islands deeper than one WC flank, are kept.
 
 Path B catches compact terminal homozygous blocks even when no deletion call sits on the tip.
 
+**C. Long shallow tip with heavy deletion cover (any run count) — suppress tip-junction SCE when all hold:**
+
+1. Tip length > **15 Mb**  
+2. Tip **abuts** the WC flank  
+3. Tip `(c+w) ≤ WC flank × 0.50`  
+4. Deletion SV calls cover ≥ **50%** of the tip  
+
+Path C does **not** remove the tip run (that would collapse multi-switch chromosomes and rewrite unrelated proximal calls). It only suppresses the WC↔homo tip SCE. Targets arm-scale hemizygous tips where the first `del_*` starts far past the junction (e.g. T3 A10 chr4 @142.2 Mb).
+
 ---
 
 #### 2f. Drop short leading homozygous stubs on acrocentrics

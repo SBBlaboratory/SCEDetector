@@ -150,6 +150,14 @@ DEFAULT_DEL_BACKED_HOMO_TIP_MAX_DEL_GAP_BP = 2_000_000
 # ~10 Mb, ratio 0.70). Longer shallow tips stay — they often are real SCEs.
 DEFAULT_SHALLOW_HOMO_TIP_MAX_LEN_BP = 15_000_000
 DEFAULT_SHALLOW_HOMO_TIP_MAX_TOT_RATIO = 0.70
+# Long tip (> short-tip length bar) that is ~half-depth vs the WC flank and
+# mostly tiled by deletion SV calls: suppress the tip-junction SCE (keep the
+# tip run) even when run count > 2 or the first deletion sits far from the
+# junction (e.g. T3 A10 chr4 qter WW, ratio ~0.47, del cover ~0.70, first
+# del ~11 Mb past the WC↔WW edge). Tuned so current M/T1 calls and other
+# T3 tip SCEs stay.
+DEFAULT_LONG_SHALLOW_HOMO_TIP_MAX_TOT_RATIO = 0.50
+DEFAULT_LONG_SHALLOW_HOMO_TIP_MIN_DEL_FRAC = 0.50
 # Acrocentric q-proximal homozygous stub after p/cen masking: a few bins of
 # WW/CC then a long WC look like an SCE but are almost always mask edge noise
 # (e.g. C86 chr14 CC 20.6–21.2). Cap is tight so real arm-scale tip SCEs stay.
@@ -347,6 +355,7 @@ def _call_events_on_arm(
     skip_sv: list[tuple[int, int]] | None = None,
     *,
     male_chrx: bool = False,
+    suppress_tip_junctions: set[int] | None = None,
 ) -> None:
     """Call a single-switch SCE on one arm (after A-B-A cleanup)."""
     runs = _merge_runs(classes, starts, ends)
@@ -355,6 +364,11 @@ def _call_events_on_arm(
     left_cls, _, left_end = runs[0]
     right_cls, right_start, _ = runs[1]
     if not is_sce_transition(left_cls, right_cls, male_chrx=male_chrx):
+        return
+    # Suppress tip-junction SCEs that look like terminal hemizygous deletions
+    # without removing the tip run (removing it can collapse the chrom to a
+    # single switch and rewrite an unrelated centromere-proximal call).
+    if suppress_tip_junctions and right_start in suppress_tip_junctions:
         return
     breakpoint = right_start
     if raw_starts is not None and raw_ends is not None and raw_classes is not None:
@@ -1828,6 +1842,83 @@ def _drop_long_shallow_homozygous_islands(
     return classes, starts, ends
 
 
+def _long_shallow_deletion_tip_junctions(
+    classes: list[str],
+    starts: list[int],
+    ends: list[int],
+    *,
+    raw_starts: list[int],
+    raw_ends: list[int],
+    raw_c: list[float],
+    raw_w: list[float],
+    sv_raw: list[tuple[int, int, str]],
+    chrom_end: int | None,
+    male_chrx: bool = False,
+    tip_slack_bp: int = DEFAULT_TELOMERE_SV_SLACK_BP,
+    shallow_max_len_bp: int = DEFAULT_SHALLOW_HOMO_TIP_MAX_LEN_BP,
+    long_max_tot_ratio: float = DEFAULT_LONG_SHALLOW_HOMO_TIP_MAX_TOT_RATIO,
+    long_min_del_frac: float = DEFAULT_LONG_SHALLOW_HOMO_TIP_MIN_DEL_FRAC,
+) -> set[int]:
+    """
+    Junction coordinates of long ~half-depth tip-reaching homozygous runs that
+    are mostly tiled by deletion SV calls.
+
+    Returns the SCE-style breakpoint (``right_start`` of the WC↔homo switch):
+    tip start for qter tips, tip end for pter tips. Callers suppress SCEs at
+    these junctions without dropping the tip run itself.
+    """
+    if male_chrx or not classes or not sv_raw:
+        return set()
+    if (
+        shallow_max_len_bp <= 0
+        or long_max_tot_ratio <= 0
+        or long_min_del_frac <= 0
+    ):
+        return set()
+
+    runs = _merge_runs(classes, starts, ends)
+    if len(runs) < 2:
+        return set()
+
+    tip_specs = ((-1, -2, "qter"), (0, 1, "pter"))
+    junctions: set[int] = set()
+    for tip_idx, flank_idx, side in tip_specs:
+        tip_cls, tip_start, tip_end = runs[tip_idx]
+        flank_cls, flank_start, flank_end = runs[flank_idx]
+        if tip_cls == "WC" or flank_cls != "WC":
+            continue
+        if side == "qter":
+            if chrom_end is None or chrom_end - tip_end > tip_slack_bp:
+                continue
+            if tip_start != flank_end:
+                continue
+            junction = tip_start
+        else:
+            if tip_start > tip_slack_bp:
+                continue
+            if tip_end != flank_start:
+                continue
+            junction = tip_end
+
+        tip_len = tip_end - tip_start
+        if tip_len <= shallow_max_len_bp:
+            continue
+        tip_tot = _run_median_total(
+            tip_start, tip_end, raw_starts, raw_ends, raw_c, raw_w
+        )
+        flank_tot = _run_median_total(
+            flank_start, flank_end, raw_starts, raw_ends, raw_c, raw_w
+        )
+        if tip_tot is None or flank_tot is None or flank_tot <= 0:
+            continue
+        if tip_tot > flank_tot * long_max_tot_ratio:
+            continue
+        if _deletion_overlap_fraction(tip_start, tip_end, sv_raw) < long_min_del_frac:
+            continue
+        junctions.add(junction)
+    return junctions
+
+
 def _drop_deletion_backed_homozygous_tips(
     classes: list[str],
     starts: list[int],
@@ -1862,6 +1953,9 @@ def _drop_deletion_backed_homozygous_tips(
     2. **Short shallow tip (any run count):** tip length ≤ ``shallow_max_len_bp``
        and tip ``c+w`` ≤ ``shallow_max_tot_ratio`` × WC flank, even without a
        local deletion call (e.g. C86 chr1 pter WW before a WW→WC→CC twostep).
+
+    Long ~half-depth tips with heavy deletion cover are handled separately by
+    ``_long_shallow_deletion_tip_junctions`` (SCE suppressed, tip run kept).
     """
     if male_chrx or not classes:
         return classes, starts, ends
@@ -2729,9 +2823,11 @@ def detect_sce(
     coverage bands are not mistaken for gains. WC islands wedged between two
     identical homozygous runs are dropped when their strands are lopsided at
     near-flank total depth, and short depth-dropped homozygous islands inside a
-    WC run are dropped as well. Tip-reaching homozygous runs in the simple
-    WC–homo two-run layout are dropped when shallow and deletion-backed near
-    the junction. A-B-A sandwiches are resolved by subclone recurrence.
+    WC run are dropped as well.     Tip-reaching homozygous runs are dropped when they look like terminal
+    deletions (short shallow tips; two-run deletion-backed tips near the
+    junction). Long ~half-depth tips with heavy deletion cover keep the tip
+    run but suppress the tip-junction SCE. A-B-A sandwiches are resolved by
+    subclone recurrence.
     Remaining single switches are scored per arm; a centromere-crossing
     exception recovers masked single switches.
     """
@@ -2758,6 +2854,9 @@ def detect_sce(
     single_records: list[dict[str, object]] = []
     dual_records: list[dict[str, object]] = []
     barriers_by_chrom: dict[str, list[tuple[int, int]]] = {}
+    # (sample, cell, chrom, junction) — tip-junction SCEs to drop after calling
+    # (covers both single-arm calls and A-B-A dual right/left breakpoints).
+    suppress_tip_sce_keys: set[tuple[str, str, str, int]] = set()
 
     grouped = work.groupby(["sample", "cell", "chrom"], sort=False)
     for (sample, cell, chrom), group in grouped:
@@ -2925,6 +3024,33 @@ def detect_sce(
             classes, starts, ends, chrom=chrom_key
         )
 
+        # Long hemizygous tips: remember WC↔homo junctions to suppress as SCE
+        # without dropping the tip run (before A-B-A extraction consumes it).
+        suppress_tip_junctions: set[int] = set()
+        if (
+            has_depth
+            and classes
+            and raw_c is not None
+            and raw_w is not None
+            and not male_chrx
+        ):
+            suppress_tip_junctions = _long_shallow_deletion_tip_junctions(
+                classes,
+                starts,
+                ends,
+                raw_starts=raw_starts,
+                raw_ends=raw_ends,
+                raw_c=[float(x) for x in raw_c],
+                raw_w=[float(x) for x in raw_w],
+                sv_raw=sv_raw,
+                chrom_end=chrom_end,
+                male_chrx=male_chrx,
+            )
+            for junction in suppress_tip_junctions:
+                suppress_tip_sce_keys.add(
+                    (str(sample), str(cell), chrom_key, int(junction))
+                )
+
         # Detect A-B-A / two-step-opposite on the full chromosome.
         classes, starts, ends, aba_duals = _extract_aba_sandwiches(
             classes,
@@ -2973,6 +3099,7 @@ def detect_sce(
                 raw_classes=raw_classes,
                 skip_sv=skip_sv,
                 male_chrx=male_chrx,
+                suppress_tip_junctions=suppress_tip_junctions,
             )
 
         # Exception: SCE whose breakpoint sits inside the centromere.
@@ -3018,6 +3145,25 @@ def detect_sce(
     combined = pd.concat([singles, resolved_duals], ignore_index=True)
     if combined.empty:
         return pd.DataFrame(columns=list(OUTPUT_COLUMNS))
+
+    if suppress_tip_sce_keys:
+        keep_rows: list[bool] = []
+        for sample, cell, chrom, start, event in zip(
+            combined["Sample"].astype(str),
+            combined["Cell_ID"].astype(str),
+            combined["chr"].astype(str),
+            combined["start"],
+            combined["Event"],
+        ):
+            if event == "Inversion" or pd.isna(start):
+                keep_rows.append(True)
+                continue
+            keep_rows.append(
+                (sample, cell, chrom, int(start)) not in suppress_tip_sce_keys
+            )
+        combined = combined.loc[keep_rows].reset_index(drop=True)
+        if combined.empty:
+            return pd.DataFrame(columns=list(OUTPUT_COLUMNS))
 
     inversions = combined[combined["Event"] == "Inversion"].copy()
     sce_like = combined[combined["Event"] != "Inversion"].copy()
